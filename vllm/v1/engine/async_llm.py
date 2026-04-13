@@ -475,6 +475,9 @@ class AsyncLLM(EngineClient):
                         prompt=input_chunk.prompt,
                         params=sp,
                         resumable=True,
+                        online_prefill_enabled=input_chunk.online_prefill_enabled,
+                        stream_end=input_chunk.stream_end,
+                        frame_token_sizes=input_chunk.frame_token_sizes,
                         **inputs,  # type: ignore[arg-type]
                     )
                     req.external_req_id = request_id

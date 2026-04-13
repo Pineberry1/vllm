@@ -642,7 +642,6 @@ async def build_and_serve_renderer(
     await init_render_app_state(vllm_config, app.state, args)
 
     logger.info("Starting vLLM server on %s", listen_address)
-
     return await serve_http(
         app,
         sock=sock,

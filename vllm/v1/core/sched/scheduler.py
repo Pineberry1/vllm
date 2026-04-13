@@ -592,6 +592,13 @@ class Scheduler(SchedulerInterface):
                     step_skipped_waiting.prepend_request(request)
                     continue
 
+                if request.should_wait_for_online_input():
+                    request_queue.pop_request()
+                    request.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+                    self.num_waiting_for_streaming_input += 1
+                    step_skipped_waiting.prepend_request(request)
+                    continue
+
                 num_external_computed_tokens = 0
                 load_kv_async = False
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
@@ -653,9 +660,22 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
-                    threshold = self.scheduler_config.long_prefill_token_threshold
-                    if 0 < threshold < num_new_tokens:
-                        num_new_tokens = threshold
+                    if (
+                        request.is_online_prefill_request
+                        and request.decode_blocked_until_stream_end
+                    ):
+                        num_new_tokens = request.get_online_prefill_schedulable_tokens()
+                        if num_new_tokens == 0:
+                            request_queue.pop_request()
+                            step_skipped_waiting.prepend_request(request)
+                            continue
+                    if not (
+                        request.is_online_prefill_request
+                        and request.decode_blocked_until_stream_end
+                    ):
+                        threshold = self.scheduler_config.long_prefill_token_threshold
+                        if 0 < threshold < num_new_tokens:
+                            num_new_tokens = threshold
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
@@ -667,7 +687,10 @@ class Scheduler(SchedulerInterface):
                         # we can stop the scheduling here.
                         break
 
-                    num_new_tokens = min(num_new_tokens, token_budget)
+                    if num_new_tokens > token_budget:
+                        request_queue.pop_request()
+                        step_skipped_waiting.prepend_request(request)
+                        continue
                     assert num_new_tokens > 0
 
                     # Schedule encoder inputs.
@@ -965,6 +988,7 @@ class Scheduler(SchedulerInterface):
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
             request.num_computed_tokens += num_scheduled_token
+            request.refresh_online_prefill_progress()
             request.is_prefill_chunk = request.num_computed_tokens < (
                 request.num_tokens + request.num_output_placeholders
             )
@@ -993,18 +1017,20 @@ class Scheduler(SchedulerInterface):
 
         Discards the last sampled output token from the prior input chunk.
         """
-
-        # Current streaming input behaviour: Keep only computed output tokens
-        # (discard final sampled output token).
-        num_computed_tokens = session.num_computed_tokens
-        kept_output_tokens = session._all_token_ids[
-            session.num_prompt_tokens : num_computed_tokens
-        ]
-        del session._all_token_ids[num_computed_tokens:]
-        session._output_token_ids.clear()
-        assert session.prompt_token_ids is not None
-        # Extend prompt with kept output tokens.
-        session.prompt_token_ids.extend(kept_output_tokens)
+        if session.is_online_prefill_request:
+            session.discard_deferred_output_tokens()
+        else:
+            # Current streaming input behaviour: Keep only computed output tokens
+            # (discard final sampled output token).
+            num_computed_tokens = session.num_computed_tokens
+            kept_output_tokens = session._all_token_ids[
+                session.num_prompt_tokens : num_computed_tokens
+            ]
+            del session._all_token_ids[num_computed_tokens:]
+            session._output_token_ids.clear()
+            assert session.prompt_token_ids is not None
+            # Extend prompt with kept output tokens.
+            session.prompt_token_ids.extend(kept_output_tokens)
 
         if update.mm_features:
             base = session.num_tokens
@@ -1014,16 +1040,35 @@ class Scheduler(SchedulerInterface):
                 )
             session.mm_features.extend(update.mm_features)
 
-        session._all_token_ids.extend(update.prompt_token_ids or ())
-        session.prompt_token_ids.extend(update.prompt_token_ids or ())
-        # Update block hashes for the new tokens.
-        session.update_block_hashes()
-        session.num_prompt_tokens = len(session.prompt_token_ids)
+        if session.is_online_prefill_request:
+            session.append_prompt_token_ids(
+                update.prompt_token_ids,
+                frame_token_sizes=update.frame_token_sizes,
+            )
+            if update.stream_end:
+                session.mark_stream_end()
+        else:
+            session._all_token_ids.extend(update.prompt_token_ids or ())
+            session.prompt_token_ids.extend(update.prompt_token_ids or ())
+            # Update block hashes for the new tokens.
+            session.update_block_hashes()
+            session.num_prompt_tokens = len(session.prompt_token_ids)
+
+        session.num_prompt_tokens_received = session.num_prompt_tokens
         session.arrival_time = update.arrival_time
         session.sampling_params = update.sampling_params
         if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
             self.num_waiting_for_streaming_input -= 1
-        session.status = RequestStatus.WAITING
+        if (
+            session.is_online_prefill_request
+            and session.online_stream_ended
+            and session.get_unprefilled_prompt_len() == 0
+            and session.deferred_output_token_ids
+        ):
+            session.decode_blocked_until_stream_end = False
+            session.status = RequestStatus.PREEMPTED
+        else:
+            session.status = RequestStatus.WAITING
 
         if self.log_stats:
             session.record_event(EngineCoreEventType.QUEUED)
@@ -1372,13 +1417,46 @@ class Scheduler(SchedulerInterface):
             status_before_stop = request.status
 
             # Check for stop and update request status.
-            if new_token_ids:
+            if (
+                request.is_online_prefill_request
+                and request.deferred_output_token_ids
+                and request.online_stream_ended
+                and not request.decode_blocked_until_stream_end
+            ):
+                deferred_token_ids = request.take_deferred_output_token_ids()
+            else:
+                deferred_token_ids = []
+
+            if (
+                new_token_ids
+                and request.is_online_prefill_request
+                and request.decode_blocked_until_stream_end
+            ):
+                request.append_output_token_ids(new_token_ids)
+                request.deferred_output_token_ids.extend(new_token_ids)
+                new_token_ids = []
+                if request.online_stream_ended:
+                    request.decode_blocked_until_stream_end = False
+                    request.pending_stream_flush = False
+                else:
+                    stopped = True
+            elif new_token_ids:
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids
                 )
+                if deferred_token_ids:
+                    new_token_ids = deferred_token_ids + new_token_ids
             elif request.pooling_params and pooler_output is not None:
                 # Pooling stops as soon as there is output.
                 request.status = RequestStatus.FINISHED_STOPPED
+                stopped = True
+
+            if (
+                request.is_online_prefill_request
+                and request.decode_blocked_until_stream_end
+                and not request.online_stream_ended
+                and request.get_unprefilled_prompt_len() < request.online_prefill_chunk_size
+            ):
                 stopped = True
 
             routed_experts = None
@@ -1558,6 +1636,13 @@ class Scheduler(SchedulerInterface):
 
     def _handle_stopped_request(self, request: Request) -> bool:
         """Return True if finished (can be False for resumable requests)."""
+        if (
+            request.is_online_prefill_request
+            and request.online_stream_ended
+            and not request.decode_blocked_until_stream_end
+        ):
+            return True
+
         if not request.resumable:
             return True
 
@@ -1571,6 +1656,7 @@ class Scheduler(SchedulerInterface):
             request.status = RequestStatus.WAITING_FOR_STREAMING_REQ
             self.num_waiting_for_streaming_input += 1
 
+        self.prev_step_scheduled_req_ids.discard(request.request_id)
         self._enqueue_waiting_request(request)
         return False
 
@@ -1709,7 +1795,39 @@ class Scheduler(SchedulerInterface):
         existing = self.requests.get(request.request_id)
         if existing is not None:
             update = StreamingUpdate.from_request(request)
-            if existing.status != RequestStatus.WAITING_FOR_STREAMING_REQ:
+            if (
+                existing.is_online_prefill_request
+                and update is None
+                and existing.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+            ):
+                existing.mark_stream_end()
+                self.num_waiting_for_streaming_input -= 1
+                if (
+                    existing.deferred_output_token_ids
+                    and existing.get_unprefilled_prompt_len() == 0
+                ):
+                    existing.decode_blocked_until_stream_end = False
+                    existing.status = RequestStatus.PREEMPTED
+                else:
+                    existing.status = RequestStatus.WAITING
+            elif (
+                existing.is_online_prefill_request
+                and update is not None
+                and update.stream_end
+                and existing.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+                and not (update.prompt_token_ids or update.mm_features)
+            ):
+                existing.mark_stream_end()
+                self.num_waiting_for_streaming_input -= 1
+                if (
+                    existing.deferred_output_token_ids
+                    and existing.get_unprefilled_prompt_len() == 0
+                ):
+                    existing.decode_blocked_until_stream_end = False
+                    existing.status = RequestStatus.PREEMPTED
+                else:
+                    existing.status = RequestStatus.WAITING
+            elif existing.status != RequestStatus.WAITING_FOR_STREAMING_REQ:
                 assert existing.streaming_queue is not None, "duplicate request id"
                 # Queue next input chunk (or finished sentinel).
                 existing.streaming_queue.append(update)

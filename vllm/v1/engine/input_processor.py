@@ -197,6 +197,9 @@ class InputProcessor:
         priority: int = 0,
         data_parallel_rank: int | None = None,
         resumable: bool = False,
+        online_prefill_enabled: bool = False,
+        stream_end: bool = False,
+        frame_token_sizes: list[int] | None = None,
     ) -> EngineCoreRequest:
         self._validate_params(params, supported_tasks)
         self._validate_lora(lora_request)
@@ -324,6 +327,9 @@ class InputProcessor:
             data_parallel_rank=data_parallel_rank,
             trace_headers=trace_headers,
             resumable=resumable,
+            online_prefill_enabled=online_prefill_enabled,
+            stream_end=stream_end,
+            frame_token_sizes=frame_token_sizes,
         )
 
     def _validate_prompt_len(
