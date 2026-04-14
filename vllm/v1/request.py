@@ -333,10 +333,7 @@ class Request:
         target_end = self.num_prompt_tokens_prefilled
         if self.online_stream_ended:
             self.pending_stream_flush = True
-            if self.online_frame_end_positions:
-                target_end = self.online_frame_end_positions[-1]
-            else:
-                target_end = self.num_prompt_tokens_received
+            target_end = self.num_prompt_tokens_received
         else:
             if unprefilled < self.online_prefill_chunk_size:
                 return 0

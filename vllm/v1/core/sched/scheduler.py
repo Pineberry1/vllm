@@ -1047,6 +1047,12 @@ class Scheduler(SchedulerInterface):
             )
             if update.stream_end:
                 session.mark_stream_end()
+                logger.info(
+                    "online_prefill stream_end request_id=%s received=%s prefilled=%s",
+                    session.request_id,
+                    session.num_prompt_tokens_received,
+                    session.num_prompt_tokens_prefilled,
+                )
         else:
             session._all_token_ids.extend(update.prompt_token_ids or ())
             session.prompt_token_ids.extend(update.prompt_token_ids or ())
@@ -1063,9 +1069,9 @@ class Scheduler(SchedulerInterface):
             session.is_online_prefill_request
             and session.online_stream_ended
             and session.get_unprefilled_prompt_len() == 0
-            and session.deferred_output_token_ids
         ):
             session.decode_blocked_until_stream_end = False
+            session.pending_stream_flush = False
             session.status = RequestStatus.PREEMPTED
         else:
             session.status = RequestStatus.WAITING
@@ -1435,9 +1441,21 @@ class Scheduler(SchedulerInterface):
                 request.append_output_token_ids(new_token_ids)
                 request.deferred_output_token_ids.extend(new_token_ids)
                 new_token_ids = []
-                if request.online_stream_ended:
+                if (
+                    request.online_stream_ended
+                    and request.get_unprefilled_prompt_len() == 0
+                ):
                     request.decode_blocked_until_stream_end = False
                     request.pending_stream_flush = False
+                    logger.info(
+                        "online_prefill flush_with_deferred_output request_id=%s prefilled=%s received=%s",
+                        request.request_id,
+                        request.num_prompt_tokens_prefilled,
+                        request.num_prompt_tokens_received,
+                    )
+                    if check_stop(request, self.max_model_len):
+                        new_token_ids = request.take_deferred_output_token_ids()
+                    stopped = True
                 else:
                     stopped = True
             elif new_token_ids:
@@ -1457,6 +1475,21 @@ class Scheduler(SchedulerInterface):
                 and not request.online_stream_ended
                 and request.get_unprefilled_prompt_len() < request.online_prefill_chunk_size
             ):
+                stopped = True
+            elif (
+                request.is_online_prefill_request
+                and request.decode_blocked_until_stream_end
+                and request.online_stream_ended
+                and request.get_unprefilled_prompt_len() == 0
+            ):
+                request.decode_blocked_until_stream_end = False
+                request.pending_stream_flush = False
+                logger.info(
+                    "online_prefill flush_complete request_id=%s prefilled=%s received=%s",
+                    request.request_id,
+                    request.num_prompt_tokens_prefilled,
+                    request.num_prompt_tokens_received,
+                )
                 stopped = True
 
             routed_experts = None
@@ -1635,13 +1668,34 @@ class Scheduler(SchedulerInterface):
         return self.waiting or self.skipped_waiting or None
 
     def _handle_stopped_request(self, request: Request) -> bool:
-        """Return True if finished (can be False for resumable requests)."""
+        "Return True if finished (can be False for resumable requests)."
+        if (
+            request.is_online_prefill_request
+            and request.online_stream_ended
+            and request.decode_blocked_until_stream_end
+        ):
+            request.status = RequestStatus.WAITING
+            self.prev_step_scheduled_req_ids.discard(request.request_id)
+            self._enqueue_waiting_request(request)
+            return False
+
         if (
             request.is_online_prefill_request
             and request.online_stream_ended
             and not request.decode_blocked_until_stream_end
+            and request.deferred_output_token_ids
         ):
-            return True
+            logger.info(
+                "online_prefill decode_requeued request_id=%s prefilled=%s received=%s deferred=%s",
+                request.request_id,
+                request.num_prompt_tokens_prefilled,
+                request.num_prompt_tokens_received,
+                len(request.deferred_output_token_ids),
+            )
+            request.status = RequestStatus.PREEMPTED
+            self.prev_step_scheduled_req_ids.discard(request.request_id)
+            self._enqueue_waiting_request(request)
+            return False
 
         if not request.resumable:
             return True
@@ -1659,7 +1713,6 @@ class Scheduler(SchedulerInterface):
         self.prev_step_scheduled_req_ids.discard(request.request_id)
         self._enqueue_waiting_request(request)
         return False
-
     def _get_routed_experts(self, request: Request) -> np.ndarray | None:
         if not self.vllm_config.model_config.enable_return_routed_experts:
             return None
@@ -1802,11 +1855,9 @@ class Scheduler(SchedulerInterface):
             ):
                 existing.mark_stream_end()
                 self.num_waiting_for_streaming_input -= 1
-                if (
-                    existing.deferred_output_token_ids
-                    and existing.get_unprefilled_prompt_len() == 0
-                ):
+                if existing.get_unprefilled_prompt_len() == 0:
                     existing.decode_blocked_until_stream_end = False
+                    existing.pending_stream_flush = False
                     existing.status = RequestStatus.PREEMPTED
                 else:
                     existing.status = RequestStatus.WAITING
@@ -1819,11 +1870,9 @@ class Scheduler(SchedulerInterface):
             ):
                 existing.mark_stream_end()
                 self.num_waiting_for_streaming_input -= 1
-                if (
-                    existing.deferred_output_token_ids
-                    and existing.get_unprefilled_prompt_len() == 0
-                ):
+                if existing.get_unprefilled_prompt_len() == 0:
                     existing.decode_blocked_until_stream_end = False
+                    existing.pending_stream_flush = False
                     existing.status = RequestStatus.PREEMPTED
                 else:
                     existing.status = RequestStatus.WAITING
@@ -2193,7 +2242,13 @@ class Scheduler(SchedulerInterface):
             return True
 
         if request.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
-            assert not request.streaming_queue
+            if request.streaming_queue:
+                update = request.streaming_queue.popleft()
+                if update is None:
+                    self.num_waiting_for_streaming_input -= 1
+                    return True
+                self._update_request_as_session(request, update)
+                return True
             return False
 
         raise AssertionError(
