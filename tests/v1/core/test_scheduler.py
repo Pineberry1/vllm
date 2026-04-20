@@ -40,6 +40,17 @@ from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 pytestmark = pytest.mark.cpu_test
 
 
+def _make_model_runner_output(request: Request, sampled_token_ids: list[int]):
+    return ModelRunnerOutput(
+        req_ids=[request.request_id],
+        req_id_to_index={request.request_id: 0},
+        sampled_token_ids=[sampled_token_ids],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+
+
 def test_add_requests():
     scheduler = create_scheduler()
     requests = create_requests(num_requests=10)
@@ -125,6 +136,192 @@ def test_schedule_multimodal_requests():
     assert len(output.scheduled_encoder_inputs) == 10
     for req_id, encoder_input in output.scheduled_encoder_inputs.items():
         assert len(encoder_input) == 1
+
+
+def test_online_prefill_waits_for_more_streaming_tokens():
+    scheduler = create_scheduler(enable_online_prefill=True)
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=200,
+        req_ids=["online"],
+        resumable=True,
+        online_prefill_enabled=True,
+    )
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {}
+    assert request.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+
+    for chunk_size in (200, 111):
+        (update,) = create_requests(
+            num_requests=1,
+            num_tokens=chunk_size,
+            req_ids=["online"],
+            resumable=True,
+            online_prefill_enabled=True,
+        )
+        scheduler.add_request(update)
+        output = scheduler.schedule()
+        assert output.num_scheduled_tokens == {}
+        assert request.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+
+
+def test_online_prefill_hides_decode_until_stream_end():
+    scheduler = create_scheduler(enable_online_prefill=True)
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=200,
+        req_ids=["online"],
+        resumable=True,
+        online_prefill_enabled=True,
+    )
+    scheduler.add_request(request)
+    scheduler.schedule()
+
+    (update,) = create_requests(
+        num_requests=1,
+        num_tokens=200,
+        req_ids=["online"],
+        resumable=True,
+        online_prefill_enabled=True,
+    )
+    scheduler.add_request(update)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {}
+
+    (update,) = create_requests(
+        num_requests=1,
+        num_tokens=112,
+        req_ids=["online"],
+        resumable=True,
+        online_prefill_enabled=True,
+    )
+    scheduler.add_request(update)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {"online": 512}
+
+    engine_outputs = scheduler.update_from_output(
+        output, _make_model_runner_output(request, [99])
+    )
+    assert request.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+    assert request.decode_blocked_until_stream_end
+    assert request.deferred_output_token_ids == [99]
+    assert request.num_output_tokens == 1
+    assert len(scheduler.running) == 0
+    assert engine_outputs[0].outputs[0].new_token_ids == []
+
+
+def test_online_prefill_decode_starts_after_stream_end():
+    scheduler = create_scheduler(enable_online_prefill=True)
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=512,
+        req_ids=["online"],
+        resumable=True,
+        online_prefill_enabled=True,
+    )
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {"online": 512}
+    scheduler.update_from_output(output, _make_model_runner_output(request, [11]))
+    assert request.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+    assert request.deferred_output_token_ids == [11]
+
+    (end_signal,) = create_requests(num_requests=1, num_tokens=1, req_ids=["online"])
+    scheduler.add_request(end_signal)
+    assert request.status == RequestStatus.PREEMPTED
+    assert not request.decode_blocked_until_stream_end
+
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {"online": 1}
+    assert output.scheduled_cached_reqs.num_reqs == 1
+
+    engine_outputs = scheduler.update_from_output(
+        output, _make_model_runner_output(request, [12])
+    )
+    returned_tokens = engine_outputs[0].outputs[0].new_token_ids
+    assert returned_tokens == [11, 12]
+    assert request.deferred_output_token_ids == []
+
+
+def test_online_prefill_tail_flush_happens_only_after_stream_end():
+    scheduler = create_scheduler(enable_online_prefill=True)
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=700,
+        req_ids=["online"],
+        resumable=True,
+        online_prefill_enabled=True,
+    )
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {"online": 512}
+    scheduler.update_from_output(output, _make_model_runner_output(request, []))
+    assert request.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+    assert request.get_unprefilled_prompt_len() == 188
+
+    (end_signal,) = create_requests(num_requests=1, num_tokens=1, req_ids=["online"])
+    scheduler.add_request(end_signal)
+    assert request.status == RequestStatus.WAITING
+
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {"online": 188}
+    assert request.decode_blocked_until_stream_end
+
+    engine_outputs = scheduler.update_from_output(
+        output, _make_model_runner_output(request, [21])
+    )
+    assert engine_outputs[0].outputs == []
+    assert not request.decode_blocked_until_stream_end
+    assert request.deferred_output_token_ids == [21]
+
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {"online": 1}
+    engine_outputs = scheduler.update_from_output(
+        output, _make_model_runner_output(request, [22])
+    )
+    assert engine_outputs[0].outputs[0].new_token_ids == [21, 22]
+
+
+def test_online_prefill_aligns_to_frame_boundary():
+    scheduler = create_scheduler(enable_online_prefill=True)
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=200,
+        req_ids=["online"],
+        resumable=True,
+        online_prefill_enabled=True,
+        frame_token_sizes=[[200]],
+    )
+    scheduler.add_request(request)
+    scheduler.schedule()
+
+    (update,) = create_requests(
+        num_requests=1,
+        num_tokens=200,
+        req_ids=["online"],
+        resumable=True,
+        online_prefill_enabled=True,
+        frame_token_sizes=[[200]],
+    )
+    scheduler.add_request(update)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {}
+
+    (update,) = create_requests(
+        num_requests=1,
+        num_tokens=140,
+        req_ids=["online"],
+        resumable=True,
+        online_prefill_enabled=True,
+        frame_token_sizes=[[140]],
+    )
+    scheduler.add_request(update)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {"online": 540}
 
 
 def test_async_scheduling_pp_allows_rescheduling_with_output_placeholders():

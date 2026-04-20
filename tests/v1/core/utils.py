@@ -57,6 +57,7 @@ def create_scheduler(
     pipeline_parallel_size: int = 1,
     use_ec_connector: bool = False,
     ec_role: str | None = None,
+    enable_online_prefill: bool = False,
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
@@ -86,6 +87,7 @@ def create_scheduler(
         max_model_len=max_model_len,
         long_prefill_token_threshold=long_prefill_token_threshold,
         disable_chunked_mm_input=disable_chunked_mm_input,
+        enable_online_prefill=enable_online_prefill,
         enable_chunked_prefill=enable_chunked_prefill,
         async_scheduling=async_scheduling,
         is_encoder_decoder=model_config.is_encoder_decoder,
@@ -185,6 +187,10 @@ def create_requests(
     same_prompt: bool = False,
     block_size: int = 16,
     req_ids: list[str] | None = None,
+    resumable: bool = False,
+    online_prefill_enabled: bool = False,
+    stream_end: bool = False,
+    frame_token_sizes: list[list[int] | None] | None = None,
 ) -> list[Request]:
     global _none_hash_initialized
     if not _none_hash_initialized:
@@ -257,6 +263,12 @@ def create_requests(
             pooling_params=None,
             mm_features=mm_features if mm_features else None,
             block_hasher=block_hasher,
+            resumable=resumable,
+            online_prefill_enabled=online_prefill_enabled,
+            stream_end=stream_end,
+            frame_token_sizes=(
+                frame_token_sizes[i] if frame_token_sizes is not None else None
+            ),
         )
         requests.append(request)
     return requests

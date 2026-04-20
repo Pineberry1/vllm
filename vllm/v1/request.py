@@ -41,6 +41,9 @@ class StreamingUpdate:
     max_tokens: int
     arrival_time: float
     sampling_params: SamplingParams | None
+    online_prefill_enabled: bool = False
+    stream_end: bool = False
+    frame_token_sizes: list[int] | None = None
 
     @classmethod
     def from_request(cls, request: "Request") -> "StreamingUpdate | None":
@@ -52,6 +55,9 @@ class StreamingUpdate:
             max_tokens=request.max_tokens,
             arrival_time=request.arrival_time,
             sampling_params=request.sampling_params,
+            online_prefill_enabled=request.is_online_prefill_request,
+            stream_end=request.online_stream_ended,
+            frame_token_sizes=request.frame_token_sizes,
         )
 
 
@@ -73,6 +79,9 @@ class Request:
         block_hasher: Callable[["Request"], list["BlockHash"]] | None = None,
         resumable: bool = False,
         reasoning_ended: bool | None = None,
+        online_prefill_enabled: bool = False,
+        stream_end: bool = False,
+        frame_token_sizes: list[int] | None = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -175,6 +184,23 @@ class Request:
         self.resumable = resumable
         # None entry in the queue means finished.
         self.streaming_queue: deque[StreamingUpdate | None] | None = None
+        self.frame_token_sizes = frame_token_sizes
+        self.is_online_prefill_request = resumable and online_prefill_enabled
+        self.online_prefill_chunk_size = 512
+        self.online_stream_ended = stream_end
+        self.decode_blocked_until_stream_end = self.is_online_prefill_request
+        self.num_prompt_tokens_received = self.num_prompt_tokens
+        self.num_prompt_tokens_prefilled = 0
+        self.pending_stream_flush = False
+        self.deferred_output_token_ids: list[int] = []
+        self.online_frame_end_positions: list[int] = []
+        if self.is_online_prefill_request:
+            self._append_online_frame_end_positions(
+                base_prompt_tokens=0,
+                added_prompt_tokens=self.num_prompt_tokens,
+                frame_token_sizes=frame_token_sizes,
+            )
+            self.pending_stream_flush = stream_end and self.num_prompt_tokens > 0
 
     @classmethod
     def from_engine_core_request(
@@ -198,7 +224,167 @@ class Request:
             block_hasher=block_hasher,
             resumable=request.resumable,
             reasoning_ended=request.reasoning_ended,
+            online_prefill_enabled=request.online_prefill_enabled,
+            stream_end=request.stream_end,
+            frame_token_sizes=request.frame_token_sizes,
         )
+
+    def _append_online_frame_end_positions(
+        self,
+        base_prompt_tokens: int,
+        added_prompt_tokens: int,
+        frame_token_sizes: list[int] | None,
+    ) -> None:
+        if not self.is_online_prefill_request or added_prompt_tokens <= 0:
+            return
+
+        if frame_token_sizes is None:
+            return
+
+        if sum(frame_token_sizes) != added_prompt_tokens:
+            raise ValueError(
+                "frame_token_sizes must sum to the number of appended prompt tokens"
+            )
+
+        running_end = base_prompt_tokens
+        for frame_size in frame_token_sizes:
+            running_end += frame_size
+            self.online_frame_end_positions.append(running_end)
+
+    def rebuild_block_hashes(self) -> None:
+        self.block_hashes = []
+        self.update_block_hashes()
+
+    def discard_deferred_output_tokens(self) -> None:
+        had_output_tokens = bool(self.deferred_output_token_ids or self._output_token_ids)
+        if had_output_tokens:
+            del self._all_token_ids[self.num_prompt_tokens :]
+            self._output_token_ids.clear()
+            self.deferred_output_token_ids.clear()
+
+        self.num_output_placeholders = 0
+        if self.num_computed_tokens > self.num_tokens:
+            self.num_computed_tokens = self.num_tokens
+        self.refresh_online_prefill_progress()
+
+        if had_output_tokens:
+            self.rebuild_block_hashes()
+
+    def append_prompt_token_ids(
+        self,
+        new_ids: list[int] | None,
+        frame_token_sizes: list[int] | None = None,
+    ) -> None:
+        if not new_ids:
+            return
+
+        if self.prompt_token_ids is None:
+            self.prompt_token_ids = []
+
+        base_prompt_tokens = self.num_prompt_tokens
+        self.prompt_token_ids.extend(new_ids)
+        self._all_token_ids.extend(new_ids)
+        self.num_prompt_tokens = len(self.prompt_token_ids)
+        self.num_prompt_tokens_received = self.num_prompt_tokens
+        self._append_online_frame_end_positions(
+            base_prompt_tokens=base_prompt_tokens,
+            added_prompt_tokens=len(new_ids),
+            frame_token_sizes=frame_token_sizes,
+        )
+        self.rebuild_block_hashes()
+
+    def mark_stream_end(self) -> None:
+        self.online_stream_ended = True
+        self.pending_stream_flush = self.get_unprefilled_prompt_len() > 0
+
+    def get_unprefilled_prompt_len(self) -> int:
+        return self.num_prompt_tokens_received - self.num_prompt_tokens_prefilled
+
+    def refresh_online_prefill_progress(self) -> None:
+        if not self.is_online_prefill_request:
+            return
+
+        self.num_prompt_tokens_prefilled = min(
+            self.num_computed_tokens, self.num_prompt_tokens_received
+        )
+        if self.online_stream_ended:
+            self.pending_stream_flush = (
+                self.num_prompt_tokens_prefilled < self.num_prompt_tokens_received
+            )
+
+    def clamp_online_prefill_computed_tokens(self) -> None:
+        if not self.is_online_prefill_request or not self.decode_blocked_until_stream_end:
+            return
+        if self.num_computed_tokens > self.num_tokens:
+            self.num_computed_tokens = self.num_tokens
+        self.refresh_online_prefill_progress()
+
+    def take_deferred_output_token_ids(self) -> list[int]:
+        deferred = self.deferred_output_token_ids
+        self.deferred_output_token_ids = []
+        return deferred
+
+    def should_wait_for_online_input(self) -> bool:
+        return (
+            self.is_online_prefill_request
+            and self.decode_blocked_until_stream_end
+            and not self.online_stream_ended
+            and self.get_unprefilled_prompt_len() < self.online_prefill_chunk_size
+        )
+
+    def get_online_prefill_schedulable_tokens(
+        self, token_budget: int | None = None
+    ) -> int:
+        if (
+            not self.is_online_prefill_request
+            or not self.decode_blocked_until_stream_end
+        ):
+            return 0
+
+        unprefilled = self.get_unprefilled_prompt_len()
+        if unprefilled <= 0:
+            return 0
+
+        target_end = self.num_prompt_tokens_prefilled
+        if self.online_stream_ended:
+            self.pending_stream_flush = True
+            target_end = self.num_prompt_tokens_received
+        else:
+            if unprefilled < self.online_prefill_chunk_size:
+                return 0
+            min_target_end = (
+                self.num_prompt_tokens_prefilled + self.online_prefill_chunk_size
+            )
+            if self.online_frame_end_positions:
+                for frame_end in self.online_frame_end_positions:
+                    if frame_end >= min_target_end:
+                        target_end = frame_end
+                        break
+                else:
+                    return 0
+            else:
+                target_end = min_target_end
+
+        if token_budget is not None:
+            if token_budget <= 0:
+                return 0
+            max_target_end = self.num_prompt_tokens_prefilled + token_budget
+            if target_end > max_target_end:
+                # Prefer a whole-frame boundary that fits in this round. If no
+                # boundary fits, fall back to the round budget rather than
+                # stalling the request forever.
+                capped_target_end = self.num_prompt_tokens_prefilled
+                for frame_end in self.online_frame_end_positions:
+                    if frame_end <= max_target_end:
+                        capped_target_end = frame_end
+                    else:
+                        break
+                if capped_target_end > self.num_prompt_tokens_prefilled:
+                    target_end = capped_target_end
+                else:
+                    target_end = max_target_end
+
+        return max(0, target_end - self.num_prompt_tokens_prefilled)
 
     def append_output_token_ids(
         self,

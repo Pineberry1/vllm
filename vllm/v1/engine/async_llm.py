@@ -462,8 +462,10 @@ class AsyncLLM(EngineClient):
 
         async def handle_inputs():
             cancelled = False
+            saw_explicit_stream_end = False
             try:
                 async for input_chunk in input_stream:
+                    saw_explicit_stream_end = saw_explicit_stream_end or input_chunk.stream_end
                     sp = input_chunk.sampling_params
                     if sp:
                         self._validate_streaming_input_sampling_params(sp)
@@ -475,7 +477,19 @@ class AsyncLLM(EngineClient):
                         prompt=input_chunk.prompt,
                         params=sp,
                         resumable=True,
+                        online_prefill_enabled=input_chunk.online_prefill_enabled,
+                        stream_end=input_chunk.stream_end,
+                        frame_token_sizes=input_chunk.frame_token_sizes,
                         **inputs,  # type: ignore[arg-type]
+                    )
+                    logger.info(
+                        "online_prefill input_chunk external_request_id=%s internal_request_id=%s stream_end=%s online_prefill=%s prompt_tokens=%s frame_spans=%s",
+                        request_id,
+                        internal_req_id,
+                        input_chunk.stream_end,
+                        input_chunk.online_prefill_enabled,
+                        len(req.prompt_token_ids or []),
+                        input_chunk.frame_token_sizes,
                     )
                     req.external_req_id = request_id
                     if req.prompt_embeds is not None:
@@ -495,8 +509,9 @@ class AsyncLLM(EngineClient):
             finally:
                 queue._input_stream_task = None
                 if not cancelled:
-                    # Send empty final request to indicate that inputs have
-                    # finished. Don't send if cancelled (session was aborted).
+                    # Always send an empty final request so the output processor
+                    # can mark the last queued streaming chunk as final and
+                    # eventually emit a finished RequestOutput after decode.
                     await self._add_request(final_req, None, None, 0, queue)
 
         # Ensure output handler is running.
@@ -697,12 +712,15 @@ class AsyncLLM(EngineClient):
                     # TODO(rob): make into a coroutine and launch it in
                     # background thread once Prometheus overhead is non-trivial.
                     if logger_ref[0]:
-                        logger_ref[0].record(
-                            engine_idx=outputs.engine_index,
-                            scheduler_stats=outputs.scheduler_stats,
-                            iteration_stats=iteration_stats,
-                            mm_cache_stats=renderer.stat_mm_cache(),
-                        )
+                        try:
+                            logger_ref[0].record(
+                                engine_idx=outputs.engine_index,
+                                scheduler_stats=outputs.scheduler_stats,
+                                iteration_stats=iteration_stats,
+                                mm_cache_stats=renderer.stat_mm_cache(),
+                            )
+                        except Exception:
+                            logger.exception("Stat logger record failed.")
             except Exception as e:
                 logger.exception("AsyncLLM output_handler failed.")
                 output_processor.propagate_error(e)

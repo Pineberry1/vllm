@@ -52,6 +52,12 @@ def register_vllm_serve_api_routers(app: FastAPI):
 
     attach_tokenize_router(app)
 
+    from vllm.entrypoints.serve.online_prefill.api_router import (
+        attach_router as attach_online_prefill_router,
+    )
+
+    attach_online_prefill_router(app)
+
     from .instrumentator import register_instrumentator_api_routers
 
     register_instrumentator_api_routers(app)

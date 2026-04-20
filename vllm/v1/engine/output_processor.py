@@ -123,6 +123,7 @@ class StreamingUpdate:
     prompt: str | None
     prompt_token_ids: list[int] | None
     arrival_time: float
+    online_prefill_enabled: bool = False
     final: bool = False
 
 
@@ -149,6 +150,7 @@ class RequestState:
         n: int | None = None,
         temperature: float | None = None,
         stream_input: bool = False,
+        online_prefill_enabled: bool = False,
     ):
         self.request_id = request_id
         self.external_req_id = external_req_id
@@ -181,13 +183,23 @@ class RequestState:
 
         # Streaming input queue
         self.streaming_input = stream_input
+        self.online_prefill_enabled = online_prefill_enabled
         self.input_chunk_queue: deque[StreamingUpdate] | None = (
             deque() if stream_input else None
         )
+        # Streaming requests reuse the same RequestState across multiple
+        # prompt extensions, so metrics must track only the newly-accounted
+        # prompt/cache deltas for each prefill round.
+        self._stats_prompt_len_accounted = 0
+        self._stats_num_cached_tokens_accounted = 0
+        self._stats_num_external_computed_tokens_accounted = 0
 
     def apply_streaming_update(self, update: StreamingUpdate) -> None:
         # Apply the update to the request state.
         self.streaming_input = not update.final
+        self.online_prefill_enabled = (
+            self.online_prefill_enabled or update.online_prefill_enabled
+        )
         # TODO also include relevant output tokens in new prompt here
         #     (match scheduler behavior).
         if update.prompt:
@@ -203,6 +215,45 @@ class RequestState:
         if self.stats is not None:
             self.stats.arrival_time = update.arrival_time
         self.is_prefilling = True
+
+    def consume_prefill_stats(
+        self, engine_core_output: EngineCoreOutput
+    ) -> tuple[int, int, int]:
+        prompt_len = self.prompt_len
+        num_cached_tokens = engine_core_output.num_cached_tokens
+        num_external_computed_tokens = engine_core_output.num_external_computed_tokens
+
+        if not (
+            self.streaming_input
+            or self.online_prefill_enabled
+            or self.input_chunk_queue is not None
+        ):
+            return prompt_len, num_cached_tokens, num_external_computed_tokens
+
+        delta_prompt_len = max(0, prompt_len - self._stats_prompt_len_accounted)
+        delta_num_cached_tokens = max(
+            0, num_cached_tokens - self._stats_num_cached_tokens_accounted
+        )
+        delta_num_external_computed_tokens = max(
+            0,
+            num_external_computed_tokens
+            - self._stats_num_external_computed_tokens_accounted,
+        )
+
+        self._stats_prompt_len_accounted = prompt_len
+        self._stats_num_cached_tokens_accounted = max(
+            self._stats_num_cached_tokens_accounted, num_cached_tokens
+        )
+        self._stats_num_external_computed_tokens_accounted = max(
+            self._stats_num_external_computed_tokens_accounted,
+            num_external_computed_tokens,
+        )
+
+        return (
+            delta_prompt_len,
+            delta_num_cached_tokens,
+            delta_num_external_computed_tokens,
+        )
 
     @classmethod
     def from_new_request(
@@ -264,6 +315,7 @@ class RequestState:
             log_stats=log_stats,
             stream_interval=stream_interval,
             stream_input=request.resumable,
+            online_prefill_enabled=request.online_prefill_enabled,
         )
 
     def make_request_output(
@@ -559,6 +611,7 @@ class OutputProcessor:
             prompt=prompt,
             prompt_token_ids=request.prompt_token_ids,
             arrival_time=request.arrival_time,
+            online_prefill_enabled=request.online_prefill_enabled,
         )
 
         # Apply request updates now if the last input already completed.
@@ -658,8 +711,15 @@ class OutputProcessor:
             if finish_reason is not None:
                 if req_state.streaming_input:
                     if req_state.input_chunk_queue:
-                        update = req_state.input_chunk_queue.popleft()
-                        req_state.apply_streaming_update(update)
+                        if req_state.online_prefill_enabled:
+                            while req_state.input_chunk_queue:
+                                update = req_state.input_chunk_queue.popleft()
+                                req_state.apply_streaming_update(update)
+                                if not req_state.streaming_input:
+                                    break
+                        else:
+                            update = req_state.input_chunk_queue.popleft()
+                            req_state.apply_streaming_update(update)
                     else:
                         req_state.input_chunk_queue = None
                 else:
@@ -772,11 +832,18 @@ class OutputProcessor:
 
         assert engine_core_timestamp is not None
         assert req_state.stats is not None
+        (
+            prompt_len_for_stats,
+            cached_tokens_for_stats,
+            external_tokens_for_stats,
+        ) = req_state.consume_prefill_stats(engine_core_output)
         iteration_stats.update_from_output(
             engine_core_output,
             engine_core_timestamp,
             req_state.is_prefilling,
-            req_state.prompt_len,
+            prompt_len_for_stats,
+            cached_tokens_for_stats,
+            external_tokens_for_stats,
             req_state.stats,
             self.lora_states,
             req_state.lora_name,

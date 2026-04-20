@@ -41,6 +41,7 @@ class SchedulerConfig:
 
     DEFAULT_MAX_NUM_BATCHED_TOKENS: ClassVar[int] = 2048
     DEFAULT_MAX_NUM_SEQS: ClassVar[int] = 128
+    ONLINE_PREFILL_CHUNK_SIZE: ClassVar[int] = 512
 
     runner_type: RunnerType = "generate"
     """The runner type to launch for the model."""
@@ -65,9 +66,7 @@ class SchedulerConfig:
     The default value here is mainly for convenience when testing.
     In real usage, this should be set in `EngineArgs.create_engine_config`.
     """
-    max_num_batched_logprobs: int = 0
-    """Maximum number of logprobs to return per batch across all sequences.
-    Set to 0 to disable the limit."""
+
     max_num_partial_prefills: int = Field(default=1, ge=1)
     """For chunked prefill, the maximum number of sequences that can be
     partially prefilled concurrently."""
@@ -81,7 +80,8 @@ class SchedulerConfig:
     long_prefill_token_threshold: int = 0
     """For chunked prefill, a request is considered long if the prompt is
     longer than this number of tokens."""
-
+    enable_online_prefill: bool = False
+    """If True, enable the online prefill scheduler path."""
     enable_chunked_prefill: bool = True
     """If True, prefill requests can be chunked based
     on the remaining `max_num_batched_tokens`.
@@ -216,9 +216,6 @@ class SchedulerConfig:
         return None if value is None else handler(value)
 
     def __post_init__(self, max_model_len: int, is_encoder_decoder: bool) -> None:
-        # Set the maximum number of logprobs per batch.
-        # Default to 1000 if not explicitly set (or if set to 0).
-        self.max_num_batched_logprobs = self.max_num_batched_logprobs or 1000
         if is_encoder_decoder:
             # Chunked prefill should be disabled for encoder-decoder models.
             self.disable_chunked_mm_input = True
@@ -231,7 +228,12 @@ class SchedulerConfig:
 
         self.max_num_encoder_input_tokens = self.max_num_batched_tokens
         self.encoder_cache_size = self.max_num_batched_tokens
-
+        if self.enable_online_prefill:
+            logger.info_once(
+                "Online prefill is enabled with chunk_size=%d.",
+                self.ONLINE_PREFILL_CHUNK_SIZE,
+                scope="local",
+            )
         if self.enable_chunked_prefill:
             logger.info_once(
                 "Chunked prefill is enabled with max_num_batched_tokens=%d.",

@@ -67,7 +67,7 @@ class LLMEngine:
         tracing_endpoint = self.observability_config.otlp_traces_endpoint
         if tracing_endpoint is not None:
             init_tracer("vllm.llm_engine", tracing_endpoint)
-
+        
         self.log_stats = log_stats
 
         parallel_config = vllm_config.parallel_config
@@ -106,7 +106,8 @@ class LLMEngine:
             stream_interval=self.vllm_config.scheduler_config.stream_interval,
             tracing_enabled=tracing_endpoint is not None,
         )
-
+        
+        
         # EngineCore (gets EngineCoreRequests and gives EngineCoreOutputs)
         self.engine_core = EngineCoreClient.make_client(
             multiprocess_mode=multiprocess_mode,

@@ -473,7 +473,6 @@ class EngineArgs:
     max_num_seqs: int | None = None
     max_logprobs: int = ModelConfig.max_logprobs
     logprobs_mode: LogprobsMode = ModelConfig.logprobs_mode
-    max_batched_logprobs: int = ModelConfig.max_batched_logprobs
     disable_log_stats: bool = False
     aggregate_engine_logging: bool = False
     revision: str | None = ModelConfig.revision
@@ -526,7 +525,7 @@ class EngineArgs:
     num_gpu_blocks_override: int | None = CacheConfig.num_gpu_blocks_override
     model_loader_extra_config: dict = get_field(LoadConfig, "model_loader_extra_config")
     ignore_patterns: str | list[str] = get_field(LoadConfig, "ignore_patterns")
-
+    enable_online_prefill: bool | None = None
     enable_chunked_prefill: bool | None = None
     disable_chunked_mm_input: bool = SchedulerConfig.disable_chunked_mm_input
 
@@ -716,9 +715,6 @@ class EngineArgs:
         )
         model_group.add_argument("--max-logprobs", **model_kwargs["max_logprobs"])
         model_group.add_argument("--logprobs-mode", **model_kwargs["logprobs_mode"])
-        model_group.add_argument(
-            "--max-batched-logprobs", **model_kwargs["max_batched_logprobs"]
-        )
         model_group.add_argument(
             "--disable-sliding-window", **model_kwargs["disable_sliding_window"]
         )
@@ -1220,6 +1216,13 @@ class EngineArgs:
             "--scheduling-policy", **scheduler_kwargs["policy"]
         )
         scheduler_group.add_argument(
+            "--enable-online-prefill",
+            **{
+                **scheduler_kwargs["enable_online_prefill"],
+                "default": None,
+            },
+        )
+        scheduler_group.add_argument(
             "--enable-chunked-prefill",
             **{
                 **scheduler_kwargs["enable_chunked_prefill"],
@@ -1399,7 +1402,6 @@ class EngineArgs:
             enforce_eager=self.enforce_eager,
             enable_return_routed_experts=self.enable_return_routed_experts,
             max_logprobs=self.max_logprobs,
-            max_batched_logprobs=self.max_batched_logprobs,
             logprobs_mode=self.logprobs_mode,
             disable_sliding_window=self.disable_sliding_window,
             disable_cascade_attn=self.disable_cascade_attn,
@@ -1787,6 +1789,8 @@ class EngineArgs:
             "max_num_batched_tokens must be set by this point"
         )
         assert self.max_num_seqs is not None, "max_num_seqs must be set by this point"
+        if self.enable_online_prefill is None:
+            self.enable_online_prefill = False
         assert self.enable_chunked_prefill is not None, (
             "enable_chunked_prefill must be set by this point"
         )
@@ -1798,6 +1802,7 @@ class EngineArgs:
             max_num_batched_tokens=self.max_num_batched_tokens,
             max_num_seqs=self.max_num_seqs,
             max_model_len=model_config.max_model_len,
+            enable_online_prefill=self.enable_online_prefill,
             enable_chunked_prefill=self.enable_chunked_prefill,
             disable_chunked_mm_input=self.disable_chunked_mm_input,
             is_multimodal_model=model_config.is_multimodal_model,
