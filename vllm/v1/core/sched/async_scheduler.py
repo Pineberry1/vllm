@@ -20,7 +20,10 @@ class AsyncScheduler(Scheduler):
         spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
         for req_id in scheduler_output.num_scheduled_tokens:
             request = self.requests[req_id]
-            if request.is_prefill_chunk:
+            if request.is_prefill_chunk or (
+                request.is_online_prefill_request
+                and request.decode_blocked_until_stream_end
+            ):
                 continue
 
             scheduler_output.pending_structured_output_tokens |= (

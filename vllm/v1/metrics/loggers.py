@@ -135,10 +135,21 @@ class LoggingStatLogger(StatLoggerBase):
     def _enable_perf_stats(self) -> bool:
         return self.vllm_config.observability_config.enable_mfu_metrics
 
-    def _track_iteration_stats(self, iteration_stats: IterationStats):
-        # Save tracked stats for token counters.
-        # Use computed tokens for prompt throughput (excludes cached/transferred)
-        self.num_prompt_tokens += iteration_stats.prompt_token_stats.computed
+    def _track_iteration_stats(
+        self,
+        iteration_stats: IterationStats,
+        scheduler_stats: SchedulerStats | None,
+    ):
+        # For prompt throughput, use scheduler-issued prompt tokens when
+        # available so long-running chunked prefills are reflected immediately
+        # instead of only after the request emits an output.
+        scheduled_prompt_tokens = (
+            0 if scheduler_stats is None else scheduler_stats.scheduled_prompt_tokens
+        )
+        self.num_prompt_tokens += max(
+            iteration_stats.prompt_token_stats.computed,
+            scheduled_prompt_tokens,
+        )
         self.num_generation_tokens += iteration_stats.num_generation_tokens
         self.num_corrupted_reqs += iteration_stats.num_corrupted_reqs
         self.num_preemptions += iteration_stats.num_preempted_reqs
@@ -163,7 +174,7 @@ class LoggingStatLogger(StatLoggerBase):
     ):
         """Log Stats to standard output."""
         if iteration_stats:
-            self._track_iteration_stats(iteration_stats)
+            self._track_iteration_stats(iteration_stats, scheduler_stats)
 
         if scheduler_stats is not None:
             self.prefix_caching_metrics.observe(scheduler_stats.prefix_cache_stats)

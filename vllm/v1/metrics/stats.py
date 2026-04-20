@@ -173,6 +173,7 @@ class SchedulerStats:
 
     num_running_reqs: int = 0
     num_waiting_reqs: int = 0
+    scheduled_prompt_tokens: int = 0
 
     # These are used for internal DP load-balancing.
     step_counter: int = 0
@@ -274,16 +275,23 @@ class PromptTokenStats:
         prompt_len: int,
     ) -> None:
         """Update stats from a prefill output."""
+        prompt_len = max(0, prompt_len)
+        num_cached_tokens = max(0, min(num_cached_tokens, prompt_len))
+        num_external_computed_tokens = max(0, num_external_computed_tokens)
+
         # When all tokens are cached, the scheduler reduces num_cached_tokens
         # by 1 to force the model to recompute the last token, since the model
         # needs at least one input token to run a forward pass.
         recomputed = 1 if (num_cached_tokens + 1 == prompt_len) else 0
 
-        self.computed += prompt_len - num_cached_tokens
-        self.external_kv_transfer += num_external_computed_tokens
-        self.local_cache_hit += (
-            num_cached_tokens + recomputed - num_external_computed_tokens
+        computed_tokens = max(0, prompt_len - num_cached_tokens)
+        local_cache_hit_tokens = max(
+            0, num_cached_tokens + recomputed - num_external_computed_tokens
         )
+
+        self.computed += computed_tokens
+        self.external_kv_transfer += num_external_computed_tokens
+        self.local_cache_hit += local_cache_hit_tokens
         self.cached_tokens += num_cached_tokens
         self.recomputed_tokens += recomputed
         self.total += prompt_len
@@ -334,6 +342,8 @@ class IterationStats:
         engine_core_timestamp: float,
         is_prefilling: bool,
         prompt_len: int,
+        num_cached_tokens: int,
+        num_external_computed_tokens: int,
         req_stats: RequestStateStats,
         lora_states: "LoRARequestStates",
         lora_name: str | None,
@@ -343,8 +353,8 @@ class IterationStats:
         self.num_generation_tokens += num_new_generation_tokens
         if is_prefilling:
             self.prompt_token_stats.update_from_output(
-                num_cached_tokens=output.num_cached_tokens,
-                num_external_computed_tokens=output.num_external_computed_tokens,
+                num_cached_tokens=num_cached_tokens,
+                num_external_computed_tokens=num_external_computed_tokens,
                 prompt_len=prompt_len,
             )
 

@@ -187,6 +187,12 @@ class RequestState:
         self.input_chunk_queue: deque[StreamingUpdate] | None = (
             deque() if stream_input else None
         )
+        # Streaming requests reuse the same RequestState across multiple
+        # prompt extensions, so metrics must track only the newly-accounted
+        # prompt/cache deltas for each prefill round.
+        self._stats_prompt_len_accounted = 0
+        self._stats_num_cached_tokens_accounted = 0
+        self._stats_num_external_computed_tokens_accounted = 0
 
     def apply_streaming_update(self, update: StreamingUpdate) -> None:
         # Apply the update to the request state.
@@ -209,6 +215,45 @@ class RequestState:
         if self.stats is not None:
             self.stats.arrival_time = update.arrival_time
         self.is_prefilling = True
+
+    def consume_prefill_stats(
+        self, engine_core_output: EngineCoreOutput
+    ) -> tuple[int, int, int]:
+        prompt_len = self.prompt_len
+        num_cached_tokens = engine_core_output.num_cached_tokens
+        num_external_computed_tokens = engine_core_output.num_external_computed_tokens
+
+        if not (
+            self.streaming_input
+            or self.online_prefill_enabled
+            or self.input_chunk_queue is not None
+        ):
+            return prompt_len, num_cached_tokens, num_external_computed_tokens
+
+        delta_prompt_len = max(0, prompt_len - self._stats_prompt_len_accounted)
+        delta_num_cached_tokens = max(
+            0, num_cached_tokens - self._stats_num_cached_tokens_accounted
+        )
+        delta_num_external_computed_tokens = max(
+            0,
+            num_external_computed_tokens
+            - self._stats_num_external_computed_tokens_accounted,
+        )
+
+        self._stats_prompt_len_accounted = prompt_len
+        self._stats_num_cached_tokens_accounted = max(
+            self._stats_num_cached_tokens_accounted, num_cached_tokens
+        )
+        self._stats_num_external_computed_tokens_accounted = max(
+            self._stats_num_external_computed_tokens_accounted,
+            num_external_computed_tokens,
+        )
+
+        return (
+            delta_prompt_len,
+            delta_num_cached_tokens,
+            delta_num_external_computed_tokens,
+        )
 
     @classmethod
     def from_new_request(
@@ -675,20 +720,8 @@ class OutputProcessor:
                         else:
                             update = req_state.input_chunk_queue.popleft()
                             req_state.apply_streaming_update(update)
-
-                        if not req_state.streaming_input and not req_state.input_chunk_queue:
-                            self._finish_request(req_state)
-                            if request_output is not None:
-                                request_output.finished = True
-                            elif req_state.queue is not None:
-                                req_state.queue.put(STREAM_FINISHED)
                     else:
                         req_state.input_chunk_queue = None
-                        self._finish_request(req_state)
-                        if request_output is not None:
-                            request_output.finished = True
-                        elif req_state.queue is not None:
-                            req_state.queue.put(STREAM_FINISHED)
                 else:
                     self._finish_request(req_state)
                     if not engine_core_output.finished:
@@ -799,11 +832,18 @@ class OutputProcessor:
 
         assert engine_core_timestamp is not None
         assert req_state.stats is not None
+        (
+            prompt_len_for_stats,
+            cached_tokens_for_stats,
+            external_tokens_for_stats,
+        ) = req_state.consume_prefill_stats(engine_core_output)
         iteration_stats.update_from_output(
             engine_core_output,
             engine_core_timestamp,
             req_state.is_prefilling,
-            req_state.prompt_len,
+            prompt_len_for_stats,
+            cached_tokens_for_stats,
+            external_tokens_for_stats,
             req_state.stats,
             self.lora_states,
             req_state.lora_name,

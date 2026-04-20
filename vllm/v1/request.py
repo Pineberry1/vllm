@@ -256,13 +256,19 @@ class Request:
         self.update_block_hashes()
 
     def discard_deferred_output_tokens(self) -> None:
-        if not self.deferred_output_token_ids and not self._output_token_ids:
-            return
+        had_output_tokens = bool(self.deferred_output_token_ids or self._output_token_ids)
+        if had_output_tokens:
+            del self._all_token_ids[self.num_prompt_tokens :]
+            self._output_token_ids.clear()
+            self.deferred_output_token_ids.clear()
 
-        del self._all_token_ids[self.num_prompt_tokens :]
-        self._output_token_ids.clear()
-        self.deferred_output_token_ids.clear()
-        self.rebuild_block_hashes()
+        self.num_output_placeholders = 0
+        if self.num_computed_tokens > self.num_tokens:
+            self.num_computed_tokens = self.num_tokens
+        self.refresh_online_prefill_progress()
+
+        if had_output_tokens:
+            self.rebuild_block_hashes()
 
     def append_prompt_token_ids(
         self,
@@ -306,6 +312,13 @@ class Request:
                 self.num_prompt_tokens_prefilled < self.num_prompt_tokens_received
             )
 
+    def clamp_online_prefill_computed_tokens(self) -> None:
+        if not self.is_online_prefill_request or not self.decode_blocked_until_stream_end:
+            return
+        if self.num_computed_tokens > self.num_tokens:
+            self.num_computed_tokens = self.num_tokens
+        self.refresh_online_prefill_progress()
+
     def take_deferred_output_token_ids(self) -> list[int]:
         deferred = self.deferred_output_token_ids
         self.deferred_output_token_ids = []
@@ -319,7 +332,9 @@ class Request:
             and self.get_unprefilled_prompt_len() < self.online_prefill_chunk_size
         )
 
-    def get_online_prefill_schedulable_tokens(self) -> int:
+    def get_online_prefill_schedulable_tokens(
+        self, token_budget: int | None = None
+    ) -> int:
         if (
             not self.is_online_prefill_request
             or not self.decode_blocked_until_stream_end
@@ -349,6 +364,25 @@ class Request:
                     return 0
             else:
                 target_end = min_target_end
+
+        if token_budget is not None:
+            if token_budget <= 0:
+                return 0
+            max_target_end = self.num_prompt_tokens_prefilled + token_budget
+            if target_end > max_target_end:
+                # Prefer a whole-frame boundary that fits in this round. If no
+                # boundary fits, fall back to the round budget rather than
+                # stalling the request forever.
+                capped_target_end = self.num_prompt_tokens_prefilled
+                for frame_end in self.online_frame_end_positions:
+                    if frame_end <= max_target_end:
+                        capped_target_end = frame_end
+                    else:
+                        break
+                if capped_target_end > self.num_prompt_tokens_prefilled:
+                    target_end = capped_target_end
+                else:
+                    target_end = max_target_end
 
         return max(0, target_end - self.num_prompt_tokens_prefilled)
 

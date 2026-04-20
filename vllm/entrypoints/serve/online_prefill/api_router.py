@@ -72,7 +72,7 @@ class _OnlinePrefillSession:
     sampling_params: SamplingParams
     created_at: float
     updated_at: float
-    queue: asyncio.Queue[StreamingInput | object]
+    queue: asyncio.Queue[StreamingInput | _QueuedAppend | object]
     generation_task: asyncio.Task[None]
     prefix_prompt: ProcessorInputs
     suffix_prompt: ProcessorInputs
@@ -85,6 +85,12 @@ class _OnlinePrefillSession:
     output_text: str | None = None
     error: str | None = None
     prompt_token_counts: list[int] = field(default_factory=list)
+
+
+@dataclass
+class _QueuedAppend:
+    frames: list[OnlinePrefillFrame] = field(default_factory=list)
+    stream_end: bool = False
 
 
 class OnlinePrefillSessionManager:
@@ -121,7 +127,7 @@ class OnlinePrefillSessionManager:
                 self._build_suffix_text(request.prompt)
             )
 
-            queue: asyncio.Queue[StreamingInput | object] = asyncio.Queue()
+            queue: asyncio.Queue[StreamingInput | _QueuedAppend | object] = asyncio.Queue()
             now = time.time()
             session = _OnlinePrefillSession(
                 request_id=request.request_id,
@@ -161,33 +167,21 @@ class OnlinePrefillSessionManager:
         if session.error is not None:
             raise HTTPException(status_code=500, detail=session.error)
 
-        if append_request.frames:
-            images = [self._decode_frame(frame) for frame in append_request.frames]
-            prompt, frame_token_sizes = self._preprocess_frame_prompt(images)
+        if append_request.frames or append_request.stream_end:
             await session.queue.put(
-                StreamingInput(
-                    prompt=prompt,
-                    online_prefill_enabled=True,
-                    frame_token_sizes=frame_token_sizes,
+                _QueuedAppend(
+                    frames=list(append_request.frames),
+                    stream_end=append_request.stream_end,
                 )
             )
+
+        if append_request.frames:
             session.appended_chunks += 1
-            session.appended_frames += len(images)
-            session.prompt_token_counts.append(sum(frame_token_sizes))
+            session.appended_frames += len(append_request.frames)
 
         if append_request.stream_end:
             session.stream_end_received = True
-            await session.queue.put(
-                StreamingInput(
-                    prompt=session.suffix_prompt,
-                    online_prefill_enabled=True,
-                    stream_end=True,
-                )
-            )
             await session.queue.put(_STREAM_DONE)
-            session.prompt_token_counts.append(
-                self._prompt_token_count(session.suffix_prompt)
-            )
             session.status = "waiting_for_decode"
 
         session.updated_at = time.time()
@@ -216,8 +210,27 @@ class OnlinePrefillSessionManager:
                 item = await session.queue.get()
                 if item is _STREAM_DONE:
                     return
-                assert isinstance(item, StreamingInput)
-                yield item
+                if isinstance(item, StreamingInput):
+                    yield item
+                    continue
+
+                assert isinstance(item, _QueuedAppend)
+                if item.frames:
+                    streaming_input, prompt_token_count = await asyncio.to_thread(
+                        self._prepare_append_streaming_input,
+                        item.frames,
+                    )
+                    session.prompt_token_counts.append(prompt_token_count)
+                    yield streaming_input
+                if item.stream_end:
+                    session.prompt_token_counts.append(
+                        self._prompt_token_count(session.suffix_prompt)
+                    )
+                    yield StreamingInput(
+                        prompt=session.suffix_prompt,
+                        online_prefill_enabled=True,
+                        stream_end=True,
+                    )
 
         try:
             async for output in self.engine_client.generate(
@@ -251,10 +264,17 @@ class OnlinePrefillSessionManager:
         elif session.status != "waiting_for_decode":
             session.status = "streaming"
         if output.outputs:
-            session.output_text = output.outputs[0].text
+            first_output = output.outputs[0]
+            output_text = first_output.text or ""
+            if output_text:
+                if session.output_text and not output_text.startswith(session.output_text):
+                    session.output_text += output_text
+                else:
+                    session.output_text = output_text
         if output.finished:
             session.finished = True
             session.status = "finished"
+
     @staticmethod
     def _build_prefix_text(system_prompt: str) -> str:
         if system_prompt:
@@ -271,9 +291,24 @@ class OnlinePrefillSessionManager:
     def _preprocess_text_prompt(self, prompt: str) -> ProcessorInputs:
         return self.input_preprocessor.preprocess({"prompt": prompt})
 
+    def _prepare_append_streaming_input(
+        self,
+        frames: list[OnlinePrefillFrame],
+    ) -> tuple[StreamingInput, int]:
+        images = [self._decode_frame(frame) for frame in frames]
+        prompt, frame_token_sizes = self._preprocess_frame_prompt(images)
+        return (
+            StreamingInput(
+                prompt=prompt,
+                online_prefill_enabled=True,
+                frame_token_sizes=frame_token_sizes,
+            ),
+            self._prompt_token_count(prompt),
+        )
+
     def _preprocess_frame_prompt(
         self, images: list[Image.Image]
-    ) -> tuple[ProcessorInputs, list[int]]:
+    ) -> tuple[ProcessorInputs, list[int] | None]:
         raw_prompt = QWEN_VL_IMAGE_PLACEHOLDER * len(images)
         prompt = self.input_preprocessor.preprocess(
             {
@@ -289,16 +324,9 @@ class OnlinePrefillSessionManager:
             )
 
         prompt_token_ids = decoder_inputs["prompt_token_ids"]
-        frame_token_sizes = self._compute_frame_token_sizes(images)
-        if sum(frame_token_sizes) != len(prompt_token_ids):
-            raise HTTPException(
-                status_code=500,
-                detail=(
-                    "frame token spans do not align with the appended prompt "
-                    "tokens; expected a pure frame placeholder chunk"
-                ),
-            )
-        return prompt, frame_token_sizes
+        if len(images) == 1:
+            return prompt, [len(prompt_token_ids)]
+        return prompt, None
 
     def _compute_frame_token_sizes(self, images: list[Image.Image]) -> list[int]:
         frame_token_sizes: list[int] = []
