@@ -10,6 +10,7 @@ from typing import Any, cast
 import numpy as np
 import torch
 
+from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.outputs import (
     STREAM_FINISHED,
@@ -40,6 +41,7 @@ from vllm.v1.metrics.stats import (
 
 # shared empty CPU tensor used as a placeholder pooling output
 EMPTY_CPU_TENSOR = torch.empty(0, device="cpu")
+logger = init_logger(__name__)
 
 
 class RequestOutputCollector:
@@ -697,6 +699,19 @@ class OutputProcessor:
                 kv_transfer_params,
                 routed_experts,
             ):
+                if req_state.online_prefill_enabled and isinstance(request_output, RequestOutput):
+                    preview = ""
+                    if request_output.outputs:
+                        preview = (request_output.outputs[0].text or "")[:80]
+                    logger.info(
+                        "online_prefill output_processor request_id=%s finish_reason=%s new_token_count=%s streaming_input=%s output_finished=%s preview=%r",
+                        req_id,
+                        finish_reason,
+                        len(new_token_ids),
+                        req_state.streaming_input,
+                        request_output.finished,
+                        preview,
+                    )
                 if req_state.streaming_input:
                     request_output.finished = False
 
@@ -709,6 +724,7 @@ class OutputProcessor:
 
             # Free completed requests.
             if finish_reason is not None:
+                request_fully_finished = False
                 if req_state.streaming_input:
                     if req_state.input_chunk_queue:
                         if req_state.online_prefill_enabled:
@@ -721,10 +737,27 @@ class OutputProcessor:
                             update = req_state.input_chunk_queue.popleft()
                             req_state.apply_streaming_update(update)
                     else:
+                        req_state.streaming_input = False
+
+                    if not req_state.streaming_input:
                         req_state.input_chunk_queue = None
+                        request_fully_finished = True
                 else:
+                    request_fully_finished = True
+
+                if request_fully_finished:
+                    if req_state.online_prefill_enabled:
+                        logger.info(
+                            "online_prefill request_fully_finished request_id=%s finish_reason=%s engine_finished=%s queue_present=%s",
+                            req_id,
+                            finish_reason,
+                            engine_core_output.finished,
+                            req_state.queue is not None,
+                        )
                     self._finish_request(req_state)
-                    if not engine_core_output.finished:
+                    if req_state.queue is not None and engine_core_output.finished:
+                        req_state.queue.put(STREAM_FINISHED)
+                    elif not engine_core_output.finished:
                         # If req not finished in EngineCore, but Detokenizer
                         # detected stop string, abort needed in EngineCore.
                         reqs_to_abort.append(req_id)

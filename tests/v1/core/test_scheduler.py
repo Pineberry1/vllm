@@ -286,6 +286,47 @@ def test_online_prefill_tail_flush_happens_only_after_stream_end():
     assert engine_outputs[0].outputs[0].new_token_ids == [21, 22]
 
 
+def test_online_prefill_marks_stream_end_when_final_signal_arrives_while_running():
+    scheduler = create_scheduler(enable_online_prefill=True)
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=512,
+        req_ids=["online"],
+        resumable=True,
+        online_prefill_enabled=True,
+    )
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    scheduler.update_from_output(output, _make_model_runner_output(request, [11]))
+    assert request.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+
+    (update,) = create_requests(
+        num_requests=1,
+        num_tokens=600,
+        req_ids=["online"],
+        resumable=True,
+        online_prefill_enabled=True,
+    )
+    scheduler.add_request(update)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {"online": 512}
+    assert request.status == RequestStatus.RUNNING
+
+    (end_signal,) = create_requests(num_requests=1, num_tokens=1, req_ids=["online"])
+    scheduler.add_request(end_signal)
+    assert request.online_stream_ended is False
+
+    scheduler.update_from_output(output, _make_model_runner_output(request, [12]))
+    assert request.online_stream_ended is True
+    assert request.status == RequestStatus.WAITING
+    assert request.decode_blocked_until_stream_end is True
+
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {"online": 88}
+    assert request.status == RequestStatus.RUNNING
+
+
 def test_online_prefill_aligns_to_frame_boundary():
     scheduler = create_scheduler(enable_online_prefill=True)
     (request,) = create_requests(

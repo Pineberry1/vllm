@@ -682,6 +682,12 @@ class Scheduler(SchedulerInterface):
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
 
+                if (
+                    request.is_online_prefill_request
+                    and request.decode_blocked_until_stream_end
+                ):
+                    request.refresh_online_prefill_progress(num_computed_tokens)
+
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
                 new_encoder_compute_budget = encoder_compute_budget
@@ -1139,9 +1145,20 @@ class Scheduler(SchedulerInterface):
             # Update block hashes for the new tokens.
             session.update_block_hashes()
             session.num_prompt_tokens = len(session.prompt_token_ids)
+            if update.stream_end:
+                session.mark_stream_end()
+                logger.info(
+                    "online_prefill stream_end request_id=%s received=%s prefilled=%s",
+                    session.request_id,
+                    session.num_prompt_tokens_received,
+                    session.num_prompt_tokens_prefilled,
+                )
 
         session.num_prompt_tokens_received = session.num_prompt_tokens
-        session.clamp_online_prefill_computed_tokens()
+        if session.is_online_prefill_request:
+            self._reset_online_prefill_prefix_state(session)
+        else:
+            session.clamp_online_prefill_computed_tokens()
         session.arrival_time = update.arrival_time
         session.sampling_params = update.sampling_params
         self._leave_waiting_for_streaming_input(session)
@@ -1207,13 +1224,12 @@ class Scheduler(SchedulerInterface):
     def _can_coalesce_online_streaming_update(
         request: Request, update: StreamingUpdate
     ) -> bool:
-        return (
-            request.is_online_prefill_request
-            and update.online_prefill_enabled
-            and not update.stream_end
-            and bool(update.prompt_token_ids)
-            and bool(update.mm_features)
-        )
+        # Online-prefill batching now happens before preprocess in the API
+        # layer so each yielded StreamingUpdate already represents one valid
+        # multimodal prompt segment. Avoid concatenating separately-processed
+        # multimodal chunks here; doing so can change prompt semantics and
+        # cause the model to stop immediately with EOS.
+        return False
 
     @staticmethod
     def _merge_online_streaming_updates(
@@ -1876,13 +1892,22 @@ class Scheduler(SchedulerInterface):
                 0, self.num_waiting_for_streaming_input - 1
             )
 
+    def _reset_online_prefill_prefix_state(self, request: Request) -> None:
+        if not request.is_online_prefill_request:
+            return
+
+        self.kv_cache_manager.free(request)
+        request.prepare_online_prefill_prefix_rescan()
+
     def _handle_stopped_request(self, request: Request) -> bool:
         "Return True if finished (can be False for resumable requests)."
         if (
             request.is_online_prefill_request
             and request.online_stream_ended
-            and request.decode_blocked_until_stream_end
+            and request.get_unprefilled_prompt_len() > 0
         ):
+            request.decode_blocked_until_stream_end = True
+            request.pending_stream_flush = True
             logger.info(
                 "online_prefill requeue_flush request_id=%s status=%s computed=%s total=%s received=%s prefilled=%s",
                 request.request_id,
@@ -1903,14 +1928,18 @@ class Scheduler(SchedulerInterface):
             and not request.decode_blocked_until_stream_end
             and request.num_output_tokens == 0
         ):
+            request.num_output_placeholders = max(request.num_output_placeholders, 1)
+            if request.num_computed_tokens >= request.num_tokens and request.num_tokens > 0:
+                request.num_computed_tokens = request.num_tokens - 1
             logger.info(
-                "online_prefill decode_requeued request_id=%s prefilled=%s received=%s deferred=%s computed=%s total=%s",
+                "online_prefill decode_requeued request_id=%s prefilled=%s received=%s deferred=%s computed=%s total=%s placeholders=%s",
                 request.request_id,
                 request.num_prompt_tokens_prefilled,
                 request.num_prompt_tokens_received,
                 len(request.deferred_output_token_ids),
                 request.num_computed_tokens,
                 request.num_tokens,
+                request.num_output_placeholders,
             )
             request.status = RequestStatus.PREEMPTED
             self.prev_step_scheduled_req_ids.discard(request.request_id)
@@ -1920,13 +1949,24 @@ class Scheduler(SchedulerInterface):
         if not request.resumable:
             return True
 
+        if request.is_finished():
+            return True
+
         if request.streaming_queue:
             update = self._pop_next_streaming_update(request)
             if update is None:
                 # Streaming request finished.
                 if request.is_finished():
                     return True
-                if request.status == RequestStatus.RUNNING:
+                if request.is_online_prefill_request:
+                    request.mark_stream_end()
+                    if request.get_unprefilled_prompt_len() == 0:
+                        request.decode_blocked_until_stream_end = False
+                        request.pending_stream_flush = False
+                        request.status = RequestStatus.PREEMPTED
+                    else:
+                        request.status = RequestStatus.WAITING
+                elif request.status == RequestStatus.RUNNING:
                     request.status = RequestStatus.PREEMPTED
             else:
                 self._update_request_as_session(request, update)
@@ -2491,6 +2531,16 @@ class Scheduler(SchedulerInterface):
                 update = request.streaming_queue.popleft()
                 if update is None:
                     self._leave_waiting_for_streaming_input(request)
+                    if request.is_online_prefill_request:
+                        request.mark_stream_end()
+                        if request.get_unprefilled_prompt_len() == 0:
+                            request.decode_blocked_until_stream_end = False
+                            request.pending_stream_flush = False
+                            request.status = RequestStatus.PREEMPTED
+                        else:
+                            request.status = RequestStatus.WAITING
+                    else:
+                        request.status = RequestStatus.PREEMPTED
                     return True
                 self._update_request_as_session(request, update)
                 return True

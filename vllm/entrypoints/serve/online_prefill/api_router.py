@@ -181,7 +181,6 @@ class OnlinePrefillSessionManager:
 
         if append_request.stream_end:
             session.stream_end_received = True
-            await session.queue.put(_STREAM_DONE)
             session.status = "waiting_for_decode"
 
         session.updated_at = time.time()
@@ -215,14 +214,33 @@ class OnlinePrefillSessionManager:
                     continue
 
                 assert isinstance(item, _QueuedAppend)
-                if item.frames:
+                queued_frames = list(item.frames)
+                stream_end = item.stream_end
+
+                while not stream_end:
+                    try:
+                        next_item = session.queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+
+                    if next_item is _STREAM_DONE:
+                        return
+                    if isinstance(next_item, StreamingInput):
+                        await session.queue.put(next_item)
+                        break
+
+                    assert isinstance(next_item, _QueuedAppend)
+                    queued_frames.extend(next_item.frames)
+                    stream_end = stream_end or next_item.stream_end
+
+                if queued_frames:
                     streaming_input, prompt_token_count = await asyncio.to_thread(
                         self._prepare_append_streaming_input,
-                        item.frames,
+                        queued_frames,
                     )
                     session.prompt_token_counts.append(prompt_token_count)
                     yield streaming_input
-                if item.stream_end:
+                if stream_end:
                     session.prompt_token_counts.append(
                         self._prompt_token_count(session.suffix_prompt)
                     )
@@ -231,6 +249,7 @@ class OnlinePrefillSessionManager:
                         online_prefill_enabled=True,
                         stream_end=True,
                     )
+                    return
 
         try:
             async for output in self.engine_client.generate(
@@ -271,7 +290,19 @@ class OnlinePrefillSessionManager:
                     session.output_text += output_text
                 else:
                     session.output_text = output_text
+        if output.outputs:
+            logger.info(
+                "online_prefill api_output request_id=%s output_finished=%s text_preview=%r",
+                session.request_id,
+                output.finished,
+                ((output.outputs[0].text or "")[:80] if output.outputs else ""),
+            )
         if output.finished:
+            logger.info(
+                "online_prefill api_finished request_id=%s output_text_present=%s",
+                session.request_id,
+                bool(session.output_text),
+            )
             session.finished = True
             session.status = "finished"
 
@@ -324,9 +355,21 @@ class OnlinePrefillSessionManager:
             )
 
         prompt_token_ids = decoder_inputs["prompt_token_ids"]
+        mm_placeholders = decoder_inputs.get("mm_placeholders", {})
+        image_placeholders = list(mm_placeholders.get("image", ()))
+        if image_placeholders:
+            image_placeholders.sort(key=lambda x: x.offset)
+            frame_token_sizes = [placeholder.length for placeholder in image_placeholders]
+            if sum(frame_token_sizes) == len(prompt_token_ids):
+                return prompt, frame_token_sizes
+
         if len(images) == 1:
             return prompt, [len(prompt_token_ids)]
-        return prompt, None
+
+        # Fallback for processors that do not surface per-image placeholder
+        # lengths in the decoder inputs. This keeps frame boundaries intact for
+        # large merged batches even though it requires extra preprocessing.
+        return prompt, self._compute_frame_token_sizes(images)
 
     def _compute_frame_token_sizes(self, images: list[Image.Image]) -> list[int]:
         frame_token_sizes: list[int] = []
