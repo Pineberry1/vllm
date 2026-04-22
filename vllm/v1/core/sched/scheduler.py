@@ -710,7 +710,7 @@ class Scheduler(SchedulerInterface):
                             token_budget=token_budget
                         )
                         if request.online_stream_ended:
-                            logger.info(
+                            logger.debug(
                                 "online_prefill waiting_schedule request_id=%s status=%s computed=%s total=%s received=%s prefilled=%s budget=%s schedulable=%s",
                                 request.request_id,
                                 request.status.name,
@@ -844,9 +844,8 @@ class Scheduler(SchedulerInterface):
                         self.encoder_cache_manager.free(request)
                     break
 
-                # if a load is needed. Note that
-                # This information is used to determine if a load is
-                # needed for this request.
+                # KVTransfer: the connector uses this info to determine
+                # if a load is needed for this request.
                 if self.connector is not None:
                     self.connector.update_state_after_alloc(
                         request,
@@ -1177,87 +1176,17 @@ class Scheduler(SchedulerInterface):
             session.record_event(EngineCoreEventType.QUEUED)
 
     def _pop_next_streaming_update(self, request: Request) -> StreamingUpdate | None:
+        # Online-prefill batching is performed in the API layer before
+        # multimodal preprocess (see OnlinePrefillSessionManager._run_session),
+        # so each queued StreamingUpdate already represents one valid prompt
+        # segment. Scheduler-level coalescing would require concatenating
+        # separately-preprocessed multimodal chunks, which can corrupt prompt
+        # semantics (causing the model to emit EOS immediately); hence we just
+        # pop one update per call.
         assert request.streaming_queue is not None
-        update = request.streaming_queue.popleft()
-        if update is None:
-            return None
-        if not self._can_coalesce_online_streaming_update(request, update):
-            return update
-
-        merged_updates = 1
-        merged_frame_count = len(update.frame_token_sizes or ())
-        while request.streaming_queue:
-            next_update = request.streaming_queue[0]
-            if next_update is None:
-                break
-            if not self._can_coalesce_online_streaming_update(request, next_update):
-                break
-            if not self._can_extend_online_streaming_batch(update, next_update):
-                break
-            request.streaming_queue.popleft()
-            self._merge_online_streaming_updates(update, next_update)
-            merged_updates += 1
-            merged_frame_count += len(next_update.frame_token_sizes or ())
-
-        if merged_updates > 1:
-            logger.info(
-                "online_prefill merged_streaming_updates request_id=%s updates=%s frames=%s prompt_tokens=%s",
-                request.request_id,
-                merged_updates,
-                merged_frame_count,
-                len(update.prompt_token_ids or ()),
-            )
-        return update
-
-    def _can_extend_online_streaming_batch(
-        self, base_update: StreamingUpdate, next_update: StreamingUpdate
-    ) -> bool:
-        """Keep merged online-prefill updates within one scheduler batch."""
-        base_prompt_tokens = len(base_update.prompt_token_ids or ())
-        next_prompt_tokens = len(next_update.prompt_token_ids or ())
-        return (
-            base_prompt_tokens + next_prompt_tokens
-            <= self.max_num_scheduled_tokens
-        )
-
-    @staticmethod
-    def _can_coalesce_online_streaming_update(
-        request: Request, update: StreamingUpdate
-    ) -> bool:
-        # Online-prefill batching now happens before preprocess in the API
-        # layer so each yielded StreamingUpdate already represents one valid
-        # multimodal prompt segment. Avoid concatenating separately-processed
-        # multimodal chunks here; doing so can change prompt semantics and
-        # cause the model to stop immediately with EOS.
-        return False
-
-    @staticmethod
-    def _merge_online_streaming_updates(
-        base_update: StreamingUpdate, next_update: StreamingUpdate
-    ) -> None:
-        prompt_offset = len(base_update.prompt_token_ids or ())
-        if next_update.mm_features:
-            base_update.mm_features = base_update.mm_features or []
-            for mm_feature in next_update.mm_features:
-                mm_feature.mm_position = replace(
-                    mm_feature.mm_position,
-                    offset=mm_feature.mm_position.offset + prompt_offset,
-                )
-                base_update.mm_features.append(mm_feature)
-        if next_update.prompt_token_ids:
-            base_update.prompt_token_ids = base_update.prompt_token_ids or []
-            base_update.prompt_token_ids.extend(next_update.prompt_token_ids)
-        if base_update.frame_token_sizes is None or next_update.frame_token_sizes is None:
-            base_update.frame_token_sizes = None
-        else:
-            base_update.frame_token_sizes.extend(next_update.frame_token_sizes)
-        base_update.arrival_time = max(base_update.arrival_time, next_update.arrival_time)
-        if next_update.sampling_params is not None:
-            base_update.sampling_params = next_update.sampling_params
-        base_update.max_tokens = next_update.max_tokens
+        return request.streaming_queue.popleft()
 
     def _make_cached_request_data(
-
         self,
         running_reqs: list[Request],
         resumed_reqs: list[Request],
@@ -1834,7 +1763,7 @@ class Scheduler(SchedulerInterface):
         self._remove_request_from_waiting_queues(request)
         if self._is_blocked_waiting_status(request.status):
             if request.is_online_prefill_request and request.online_stream_ended:
-                logger.info(
+                logger.debug(
                     "online_prefill enqueue_waiting request_id=%s queue=skipped status=%s computed=%s total=%s received=%s prefilled=%s",
                     request.request_id,
                     request.status.name,
@@ -1846,7 +1775,7 @@ class Scheduler(SchedulerInterface):
             self.skipped_waiting.add_request(request)
         else:
             if request.is_online_prefill_request and request.online_stream_ended:
-                logger.info(
+                logger.debug(
                     "online_prefill enqueue_waiting request_id=%s queue=waiting status=%s computed=%s total=%s received=%s prefilled=%s",
                     request.request_id,
                     request.status.name,
@@ -1896,7 +1825,14 @@ class Scheduler(SchedulerInterface):
         if not request.is_online_prefill_request:
             return
 
-        self.kv_cache_manager.free(request)
+        # Do NOT call self.kv_cache_manager.free(request) here.
+        # The previously-prefilled prompt blocks are still valid and must be
+        # reused on the next prefill step; freeing them would either force a
+        # full re-prefill (when prefix caching is disabled) or pay a redundant
+        # prefix-cache lookup round-trip (when it is enabled). The trailing
+        # blocks that held now-discarded deferred-decode tokens stay mapped to
+        # this request and will simply be overwritten when the newly-appended
+        # prompt tokens are prefilled.
         request.prepare_online_prefill_prefix_rescan()
 
     def _handle_stopped_request(self, request: Request) -> bool:
@@ -2115,6 +2051,10 @@ class Scheduler(SchedulerInterface):
         return len(self.running), len(self.waiting) + len(self.skipped_waiting)
 
     def add_request(self, request: Request) -> None:
+        if request.is_online_prefill_request:
+            request.online_prefill_chunk_size = (
+                self.scheduler_config.online_prefill_chunk_size
+            )
         existing = self.requests.get(request.request_id)
         if existing is not None:
             update = StreamingUpdate.from_request(request)

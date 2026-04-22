@@ -41,7 +41,7 @@ class SchedulerConfig:
 
     DEFAULT_MAX_NUM_BATCHED_TOKENS: ClassVar[int] = 2048
     DEFAULT_MAX_NUM_SEQS: ClassVar[int] = 128
-    ONLINE_PREFILL_CHUNK_SIZE: ClassVar[int] = 512
+    DEFAULT_ONLINE_PREFILL_CHUNK_SIZE: ClassVar[int] = 512
 
     runner_type: RunnerType = "generate"
     """The runner type to launch for the model."""
@@ -82,6 +82,13 @@ class SchedulerConfig:
     longer than this number of tokens."""
     enable_online_prefill: bool = False
     """If True, enable the online prefill scheduler path."""
+    online_prefill_chunk_size: int = Field(
+        default=DEFAULT_ONLINE_PREFILL_CHUNK_SIZE, ge=1
+    )
+    """Minimum number of unprefilled prompt tokens that must accumulate before
+    an online-prefill request is scheduled for a new prefill chunk (the q
+    parameter in the online prefill design). Actual chunk boundaries are
+    aligned to frame boundaries when frame_token_sizes is provided."""
     enable_chunked_prefill: bool = True
     """If True, prefill requests can be chunked based
     on the remaining `max_num_batched_tokens`.
@@ -231,7 +238,7 @@ class SchedulerConfig:
         if self.enable_online_prefill:
             logger.info_once(
                 "Online prefill is enabled with chunk_size=%d.",
-                self.ONLINE_PREFILL_CHUNK_SIZE,
+                self.online_prefill_chunk_size,
                 scope="local",
             )
         if self.enable_chunked_prefill:

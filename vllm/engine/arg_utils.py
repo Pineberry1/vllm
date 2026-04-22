@@ -526,6 +526,7 @@ class EngineArgs:
     model_loader_extra_config: dict = get_field(LoadConfig, "model_loader_extra_config")
     ignore_patterns: str | list[str] = get_field(LoadConfig, "ignore_patterns")
     enable_online_prefill: bool | None = None
+    online_prefill_chunk_size: int = SchedulerConfig.online_prefill_chunk_size
     enable_chunked_prefill: bool | None = None
     disable_chunked_mm_input: bool = SchedulerConfig.disable_chunked_mm_input
 
@@ -1223,6 +1224,10 @@ class EngineArgs:
             },
         )
         scheduler_group.add_argument(
+            "--online-prefill-chunk-size",
+            **scheduler_kwargs["online_prefill_chunk_size"],
+        )
+        scheduler_group.add_argument(
             "--enable-chunked-prefill",
             **{
                 **scheduler_kwargs["enable_chunked_prefill"],
@@ -1803,6 +1808,7 @@ class EngineArgs:
             max_num_seqs=self.max_num_seqs,
             max_model_len=model_config.max_model_len,
             enable_online_prefill=self.enable_online_prefill,
+            online_prefill_chunk_size=self.online_prefill_chunk_size,
             enable_chunked_prefill=self.enable_chunked_prefill,
             disable_chunked_mm_input=self.disable_chunked_mm_input,
             is_multimodal_model=model_config.is_multimodal_model,

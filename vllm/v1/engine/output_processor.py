@@ -699,11 +699,15 @@ class OutputProcessor:
                 kv_transfer_params,
                 routed_experts,
             ):
-                if req_state.online_prefill_enabled and isinstance(request_output, RequestOutput):
+                if (
+                    req_state.online_prefill_enabled
+                    and isinstance(request_output, RequestOutput)
+                    and logger.isEnabledFor(10)  # logging.DEBUG
+                ):
                     preview = ""
                     if request_output.outputs:
                         preview = (request_output.outputs[0].text or "")[:80]
-                    logger.info(
+                    logger.debug(
                         "online_prefill output_processor request_id=%s finish_reason=%s new_token_count=%s streaming_input=%s output_finished=%s preview=%r",
                         req_id,
                         finish_reason,
