@@ -475,35 +475,40 @@ class Scheduler(SchedulerInterface):
                         break
 
                     # The request cannot be scheduled.
-                    # Preempt the lowest-priority request.
-                    if self.policy == SchedulingPolicy.PRIORITY:
-                        preempted_req = max(
-                            self.running,
-                            key=lambda r: (r.priority, r.arrival_time),
-                        )
-                        self.running.remove(preempted_req)
-                        if preempted_req in scheduled_running_reqs:
-                            preempted_req_id = preempted_req.request_id
-                            scheduled_running_reqs.remove(preempted_req)
-                            token_budget += num_scheduled_tokens.pop(preempted_req_id)
-                            req_to_new_blocks.pop(preempted_req_id)
-                            scheduled_spec_decode_tokens.pop(preempted_req_id, None)
-                            preempted_encoder_inputs = scheduled_encoder_inputs.pop(
-                                preempted_req_id, None
-                            )
-                            if preempted_encoder_inputs:
-                                # Restore encoder compute budget if the preempted
-                                # request had encoder inputs scheduled in this step.
-                                num_embeds_to_restore = sum(
-                                    preempted_req.get_num_encoder_embeds(i)
-                                    for i in preempted_encoder_inputs
-                                )
-                                encoder_compute_budget += num_embeds_to_restore
-                            req_index -= 1
-                    else:
-                        preempted_req = self.running.pop()
+                    # Preempt the lowest-priority eligible request.
+                    preempted_req = self._select_preemption_candidate(
+                        scheduled_running_reqs
+                    )
+                    if preempted_req is None:
+                        break
 
-                    self._preempt_request(preempted_req, scheduled_timestamp)
+                    self.running.remove(preempted_req)
+                    if preempted_req in scheduled_running_reqs:
+                        preempted_req_id = preempted_req.request_id
+                        scheduled_running_reqs.remove(preempted_req)
+                        token_budget += num_scheduled_tokens.pop(preempted_req_id)
+                        req_to_new_blocks.pop(preempted_req_id)
+                        scheduled_spec_decode_tokens.pop(preempted_req_id, None)
+                        preempted_encoder_inputs = scheduled_encoder_inputs.pop(
+                            preempted_req_id, None
+                        )
+                        if preempted_encoder_inputs:
+                            # Restore encoder compute budget if the preempted
+                            # request had encoder inputs scheduled in this step.
+                            num_embeds_to_restore = sum(
+                                preempted_req.get_num_encoder_embeds(i)
+                                for i in preempted_encoder_inputs
+                            )
+                            encoder_compute_budget += num_embeds_to_restore
+                        req_index -= 1
+
+                    self._preempt_request(
+                        preempted_req,
+                        scheduled_timestamp,
+                        preserve_kv_cache=self._should_preserve_kv_cache_on_preemption(
+                            preempted_req
+                        ),
+                    )
                     preempted_reqs.append(preempted_req)
                     if preempted_req == request:
                         # No more request to preempt. Cannot schedule this request.
@@ -1038,7 +1043,44 @@ class Scheduler(SchedulerInterface):
     ) -> KVConnectorMetadata:
         return connector.build_connector_meta(scheduler_output)
 
-    def _preempt_request(self, request: Request, timestamp: float) -> None:
+    def _should_preserve_kv_cache_on_preemption(self, request: Request) -> bool:
+        return (
+            request.is_online_prefill_request
+            and not self.cache_config.enable_prefix_caching
+            and request.num_computed_tokens > 0
+        )
+
+    def _can_preempt_request(
+        self,
+        request: Request,
+        scheduled_running_reqs: list[Request],
+    ) -> bool:
+        return (
+            not self._should_preserve_kv_cache_on_preemption(request)
+            or request in scheduled_running_reqs
+        )
+
+    def _select_preemption_candidate(
+        self,
+        scheduled_running_reqs: list[Request],
+    ) -> Request | None:
+        candidates = [
+            req
+            for req in self.running
+            if self._can_preempt_request(req, scheduled_running_reqs)
+        ]
+        if not candidates:
+            return None
+        if self.policy == SchedulingPolicy.PRIORITY:
+            return max(candidates, key=lambda r: (r.priority, r.arrival_time))
+        return candidates[-1]
+
+    def _preempt_request(
+        self,
+        request: Request,
+        timestamp: float,
+        preserve_kv_cache: bool = False,
+    ) -> None:
         """Preempt a request and put it back to the waiting queue.
 
         NOTE: The request should be popped from the running queue outside of this
@@ -1047,10 +1089,22 @@ class Scheduler(SchedulerInterface):
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
-        self.kv_cache_manager.free(request)
+        if preserve_kv_cache:
+            # Keep already-computed prompt KV resident for prefix-cache-disabled
+            # online-prefill requests. This avoids forcing the next chunk to
+            # re-prefill the entire prefix from scratch after a scheduler
+            # preemption. Any speculative tail allocated in the current
+            # scheduling pass is trimmed back to the last computed token.
+            self.kv_cache_manager.remove_skipped_blocks(
+                request_id=request.request_id,
+                total_computed_tokens=request.num_computed_tokens,
+            )
+        else:
+            self.kv_cache_manager.free(request)
         self.encoder_cache_manager.free(request)
         request.status = RequestStatus.PREEMPTED
-        request.num_computed_tokens = 0
+        if not preserve_kv_cache:
+            request.num_computed_tokens = 0
         if request.spec_token_ids:
             request.spec_token_ids = []
         request.num_preemptions += 1
@@ -1058,7 +1112,7 @@ class Scheduler(SchedulerInterface):
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
 
         # Put the request back to the waiting queue.
-        self.waiting.prepend_request(request)
+        self._enqueue_waiting_request(request)
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         # Advance the number of computed tokens for the request AFTER
