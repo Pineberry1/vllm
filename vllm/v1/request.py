@@ -178,14 +178,15 @@ class Request:
         self._block_hasher: Callable[[Request], list[BlockHash]] | None = block_hasher
         self.update_block_hashes()
 
-        self.skip_reading_prefix_cache = self.get_skip_reading_prefix_cache()
-
         # Used for streaming
         self.resumable = resumable
         # None entry in the queue means finished.
         self.streaming_queue: deque[StreamingUpdate | None] | None = None
         self.frame_token_sizes = frame_token_sizes
         self.is_online_prefill_request = resumable and online_prefill_enabled
+
+        self.skip_reading_prefix_cache = self.get_skip_reading_prefix_cache()
+        # Overridden by Scheduler.add_request with the value from SchedulerConfig.
         self.online_prefill_chunk_size = 512
         self.online_stream_ended = stream_end
         self.decode_blocked_until_stream_end = self.is_online_prefill_request
@@ -300,12 +301,17 @@ class Request:
     def get_unprefilled_prompt_len(self) -> int:
         return self.num_prompt_tokens_received - self.num_prompt_tokens_prefilled
 
-    def refresh_online_prefill_progress(self) -> None:
+    def refresh_online_prefill_progress(
+        self, computed_tokens: int | None = None
+    ) -> None:
         if not self.is_online_prefill_request:
             return
 
+        if computed_tokens is None:
+            computed_tokens = self.num_computed_tokens
+
         self.num_prompt_tokens_prefilled = min(
-            self.num_computed_tokens, self.num_prompt_tokens_received
+            computed_tokens, self.num_prompt_tokens_received
         )
         if self.online_stream_ended:
             self.pending_stream_flush = (
@@ -318,6 +324,24 @@ class Request:
         if self.num_computed_tokens > self.num_tokens:
             self.num_computed_tokens = self.num_tokens
         self.refresh_online_prefill_progress()
+
+    def prepare_online_prefill_prefix_rescan(self) -> None:
+        if not self.is_online_prefill_request:
+            return
+
+        # Preserve num_computed_tokens at the last actually-prefilled prompt
+        # position. discard_deferred_output_tokens already rewound it from the
+        # deferred-decode tail back to num_prompt_tokens (and called
+        # refresh_online_prefill_progress). Freeing KV or zeroing
+        # num_computed_tokens here would force a full re-prefill from scratch
+        # whenever prefix caching is disabled, and wastes a prefix-cache lookup
+        # round-trip even when it is enabled.
+        self.num_output_placeholders = 0
+        self.num_cached_tokens = -1
+        if self.online_stream_ended:
+            self.pending_stream_flush = (
+                self.num_prompt_tokens_prefilled < self.num_prompt_tokens_received
+            )
 
     def take_deferred_output_token_ids(self) -> list[int]:
         deferred = self.deferred_output_token_ids

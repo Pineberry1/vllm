@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -28,6 +29,22 @@ router = APIRouter()
 QWEN_VL_IMAGE_PLACEHOLDER = "<|vision_start|><|image_pad|><|vision_end|>"
 DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
 _STREAM_DONE = object()
+
+
+def _read_merge_window_ms() -> float:
+    # Short coalescing window applied after the first queued append arrives.
+    # Lets sequential client POSTs (each carrying one frame) merge into a
+    # single StreamingInput so they share one vision-encoder invocation and
+    # one engine update, instead of paying per-append preprocess/encoder/
+    # scheduler overhead. Set to 0 to disable.
+    raw = os.environ.get("VLLM_ONLINE_PREFILL_MERGE_WINDOW_MS", "30")
+    try:
+        return max(0.0, float(raw)) / 1000.0
+    except ValueError:
+        return 0.030
+
+
+_MERGE_WINDOW_SEC = _read_merge_window_ms()
 
 
 class OnlinePrefillFrame(BaseModel):
@@ -74,8 +91,8 @@ class _OnlinePrefillSession:
     updated_at: float
     queue: asyncio.Queue[StreamingInput | _QueuedAppend | object]
     generation_task: asyncio.Task[None]
-    prefix_prompt: ProcessorInputs
-    suffix_prompt: ProcessorInputs
+    prefix_text: str
+    suffix_text: str
     status: str = "created"
     appended_chunks: int = 0
     appended_frames: int = 0
@@ -85,6 +102,7 @@ class _OnlinePrefillSession:
     output_text: str | None = None
     error: str | None = None
     prompt_token_counts: list[int] = field(default_factory=list)
+    input_started: bool = False
 
 
 @dataclass
@@ -120,12 +138,8 @@ class OnlinePrefillSessionManager:
                 max_tokens=request.max_tokens,
             )
 
-            prefix_prompt = self._preprocess_text_prompt(
-                self._build_prefix_text(request.system_prompt)
-            )
-            suffix_prompt = self._preprocess_text_prompt(
-                self._build_suffix_text(request.prompt)
-            )
+            prefix_text = self._build_prefix_text(request.system_prompt)
+            suffix_text = self._build_suffix_text(request.prompt)
 
             queue: asyncio.Queue[StreamingInput | _QueuedAppend | object] = asyncio.Queue()
             now = time.time()
@@ -137,21 +151,11 @@ class OnlinePrefillSessionManager:
                 updated_at=now,
                 queue=queue,
                 generation_task=asyncio.create_task(asyncio.sleep(0)),
-                prefix_prompt=prefix_prompt,
-                suffix_prompt=suffix_prompt,
+                prefix_text=prefix_text,
+                suffix_text=suffix_text,
             )
             session.generation_task = asyncio.create_task(self._run_session(session))
             self._sessions[request.request_id] = session
-
-            await queue.put(
-                StreamingInput(
-                    prompt=prefix_prompt,
-                    sampling_params=sampling_params,
-                    online_prefill_enabled=True,
-                )
-            )
-            session.status = "streaming"
-            session.prompt_token_counts.append(self._prompt_token_count(prefix_prompt))
             return session
 
     async def append(
@@ -178,10 +182,11 @@ class OnlinePrefillSessionManager:
         if append_request.frames:
             session.appended_chunks += 1
             session.appended_frames += len(append_request.frames)
+            if not append_request.stream_end:
+                session.status = "streaming"
 
         if append_request.stream_end:
             session.stream_end_received = True
-            await session.queue.put(_STREAM_DONE)
             session.status = "waiting_for_decode"
 
         session.updated_at = time.time()
@@ -215,22 +220,77 @@ class OnlinePrefillSessionManager:
                     continue
 
                 assert isinstance(item, _QueuedAppend)
-                if item.frames:
+                queued_frames = list(item.frames)
+                stream_end = item.stream_end
+
+                # Drain anything already queued synchronously first.
+                drained_terminal: Any = None
+                while not stream_end:
+                    try:
+                        next_item = session.queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+
+                    if next_item is _STREAM_DONE:
+                        drained_terminal = _STREAM_DONE
+                        break
+                    if isinstance(next_item, StreamingInput):
+                        drained_terminal = next_item
+                        break
+
+                    assert isinstance(next_item, _QueuedAppend)
+                    queued_frames.extend(next_item.frames)
+                    stream_end = stream_end or next_item.stream_end
+
+                # Merge window: wait briefly for sequential client POSTs to
+                # arrive so their frames coalesce into one StreamingInput.
+                # Client-sequential posting (POST N waits for POST N-1's HTTP
+                # response before sending POST N+1) would otherwise deliver
+                # items one at a time and defeat the drain above, causing a
+                # separate prefill/encoder pass per frame.
+                while (
+                    drained_terminal is None
+                    and not stream_end
+                    and _MERGE_WINDOW_SEC > 0
+                ):
+                    try:
+                        next_item = await asyncio.wait_for(
+                            session.queue.get(), timeout=_MERGE_WINDOW_SEC
+                        )
+                    except asyncio.TimeoutError:
+                        break
+
+                    if next_item is _STREAM_DONE:
+                        drained_terminal = _STREAM_DONE
+                        break
+                    if isinstance(next_item, StreamingInput):
+                        drained_terminal = next_item
+                        break
+
+                    assert isinstance(next_item, _QueuedAppend)
+                    queued_frames.extend(next_item.frames)
+                    stream_end = stream_end or next_item.stream_end
+
+                prefix_text = session.prefix_text if not session.input_started else ""
+                suffix_text = session.suffix_text if stream_end else ""
+
+                if queued_frames or prefix_text or suffix_text:
                     streaming_input, prompt_token_count = await asyncio.to_thread(
                         self._prepare_append_streaming_input,
-                        item.frames,
+                        queued_frames,
+                        prefix_text=prefix_text,
+                        suffix_text=suffix_text,
+                        stream_end=stream_end,
                     )
                     session.prompt_token_counts.append(prompt_token_count)
+                    session.input_started = True
                     yield streaming_input
-                if item.stream_end:
-                    session.prompt_token_counts.append(
-                        self._prompt_token_count(session.suffix_prompt)
-                    )
-                    yield StreamingInput(
-                        prompt=session.suffix_prompt,
-                        online_prefill_enabled=True,
-                        stream_end=True,
-                    )
+                if stream_end:
+                    return
+                if drained_terminal is _STREAM_DONE:
+                    return
+                if isinstance(drained_terminal, StreamingInput):
+                    yield drained_terminal
 
         try:
             async for output in self.engine_client.generate(
@@ -271,7 +331,19 @@ class OnlinePrefillSessionManager:
                     session.output_text += output_text
                 else:
                     session.output_text = output_text
+        if output.outputs and logger.isEnabledFor(10):  # logging.DEBUG
+            logger.debug(
+                "online_prefill api_output request_id=%s output_finished=%s text_preview=%r",
+                session.request_id,
+                output.finished,
+                ((output.outputs[0].text or "")[:80] if output.outputs else ""),
+            )
         if output.finished:
+            logger.info(
+                "online_prefill api_finished request_id=%s output_text_present=%s",
+                session.request_id,
+                bool(session.output_text),
+            )
             session.finished = True
             session.status = "finished"
 
@@ -294,28 +366,41 @@ class OnlinePrefillSessionManager:
     def _prepare_append_streaming_input(
         self,
         frames: list[OnlinePrefillFrame],
+        *,
+        prefix_text: str = "",
+        suffix_text: str = "",
+        stream_end: bool = False,
     ) -> tuple[StreamingInput, int]:
         images = [self._decode_frame(frame) for frame in frames]
-        prompt, frame_token_sizes = self._preprocess_frame_prompt(images)
+        prompt, frame_token_sizes = self._preprocess_prompt(
+            images,
+            prefix_text=prefix_text,
+            suffix_text=suffix_text,
+        )
         return (
             StreamingInput(
                 prompt=prompt,
                 online_prefill_enabled=True,
+                stream_end=stream_end,
                 frame_token_sizes=frame_token_sizes,
             ),
             self._prompt_token_count(prompt),
         )
 
-    def _preprocess_frame_prompt(
-        self, images: list[Image.Image]
+    def _preprocess_prompt(
+        self,
+        images: list[Image.Image],
+        *,
+        prefix_text: str = "",
+        suffix_text: str = "",
     ) -> tuple[ProcessorInputs, list[int] | None]:
-        raw_prompt = QWEN_VL_IMAGE_PLACEHOLDER * len(images)
-        prompt = self.input_preprocessor.preprocess(
-            {
-                "prompt": raw_prompt,
-                "multi_modal_data": {"image": images},
-            }
-        )
+        raw_prompt = f"{prefix_text}{QWEN_VL_IMAGE_PLACEHOLDER * len(images)}{suffix_text}"
+        preprocess_input: dict[str, Any] = {"prompt": raw_prompt}
+        if images:
+            preprocess_input["multi_modal_data"] = {"image": images}
+        prompt = self.input_preprocessor.preprocess(preprocess_input)
+        if not images:
+            return prompt, None
         _, decoder_inputs = split_enc_dec_inputs(prompt)
         if decoder_inputs["type"] != "multimodal":
             raise HTTPException(
@@ -324,31 +409,37 @@ class OnlinePrefillSessionManager:
             )
 
         prompt_token_ids = decoder_inputs["prompt_token_ids"]
+        total_tokens = len(prompt_token_ids)
+        mm_placeholders = decoder_inputs.get("mm_placeholders", {})
+        image_placeholders = sorted(
+            mm_placeholders.get("image", ()), key=lambda x: x.offset
+        )
+
+        if image_placeholders and len(image_placeholders) == len(images):
+            # Derive frame spans from placeholder offsets. Any non-placeholder
+            # tokens (e.g. BOS, wrappers, or suffix text) are absorbed into the
+            # nearest image span so that sum(spans) == total_tokens exactly.
+            boundaries = [p.offset for p in image_placeholders[1:]]
+            boundaries.append(total_tokens)
+            frame_token_sizes: list[int] = []
+            prev_end = 0
+            for end in boundaries:
+                frame_token_sizes.append(end - prev_end)
+                prev_end = end
+            return prompt, frame_token_sizes
+
         if len(images) == 1:
-            return prompt, [len(prompt_token_ids)]
+            return prompt, [total_tokens]
+
+        # Last-resort fallback: we cannot recover per-frame boundaries from the
+        # decoder inputs. Return None so the scheduler falls back to
+        # chunk-size-only boundaries (non-frame-aligned but safe).
+        logger.warning(
+            "online_prefill: processor did not surface per-image placeholders "
+            "for %d images; falling back to non-frame-aligned chunking",
+            len(images),
+        )
         return prompt, None
-
-    def _compute_frame_token_sizes(self, images: list[Image.Image]) -> list[int]:
-        frame_token_sizes: list[int] = []
-        previous_total = 0
-        for image_count in range(1, len(images) + 1):
-            prefix_prompt = self.input_preprocessor.preprocess(
-                {
-                    "prompt": QWEN_VL_IMAGE_PLACEHOLDER * image_count,
-                    "multi_modal_data": {"image": images[:image_count]},
-                }
-            )
-            _, decoder_inputs = split_enc_dec_inputs(prefix_prompt)
-            if decoder_inputs["type"] != "multimodal":
-                raise HTTPException(
-                    status_code=500,
-                    detail="expected multimodal decoder inputs for frame append",
-                )
-
-            current_total = len(decoder_inputs["prompt_token_ids"])
-            frame_token_sizes.append(current_total - previous_total)
-            previous_total = current_total
-        return frame_token_sizes
 
     @staticmethod
     def _decode_frame(frame: OnlinePrefillFrame) -> Image.Image:

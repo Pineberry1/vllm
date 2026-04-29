@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import json
 import dataclasses
 from unittest.mock import Mock
 
@@ -49,6 +50,28 @@ def _make_model_runner_output(request: Request, sampled_token_ids: list[int]):
         prompt_logprobs_dict={},
         pooler_output=[],
     )
+
+
+def _make_local_test_model(tmp_path) -> str:
+    model_dir = tmp_path / "dummy_gpt2"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["GPT2LMHeadModel"],
+                "model_type": "gpt2",
+                "vocab_size": 128,
+                "n_positions": 1024,
+                "n_ctx": 1024,
+                "n_embd": 32,
+                "n_layer": 2,
+                "n_head": 2,
+                "bos_token_id": 0,
+                "eos_token_id": 1,
+            }
+        )
+    )
+    return str(model_dir)
 
 
 def test_add_requests():
@@ -284,6 +307,47 @@ def test_online_prefill_tail_flush_happens_only_after_stream_end():
         output, _make_model_runner_output(request, [22])
     )
     assert engine_outputs[0].outputs[0].new_token_ids == [21, 22]
+
+
+def test_online_prefill_marks_stream_end_when_final_signal_arrives_while_running():
+    scheduler = create_scheduler(enable_online_prefill=True)
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=512,
+        req_ids=["online"],
+        resumable=True,
+        online_prefill_enabled=True,
+    )
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    scheduler.update_from_output(output, _make_model_runner_output(request, [11]))
+    assert request.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+
+    (update,) = create_requests(
+        num_requests=1,
+        num_tokens=600,
+        req_ids=["online"],
+        resumable=True,
+        online_prefill_enabled=True,
+    )
+    scheduler.add_request(update)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {"online": 512}
+    assert request.status == RequestStatus.RUNNING
+
+    (end_signal,) = create_requests(num_requests=1, num_tokens=1, req_ids=["online"])
+    scheduler.add_request(end_signal)
+    assert request.online_stream_ended is False
+
+    scheduler.update_from_output(output, _make_model_runner_output(request, [12]))
+    assert request.online_stream_ended is True
+    assert request.status == RequestStatus.WAITING
+    assert request.decode_blocked_until_stream_end is True
+
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {"online": 88}
+    assert request.status == RequestStatus.RUNNING
 
 
 def test_online_prefill_aligns_to_frame_boundary():
@@ -937,6 +1001,137 @@ def test_preempt_during_execution():
     # sampled token id.
     assert len(requests[1].output_token_ids) == 1
     assert requests[1].output_token_ids[0] == 42
+
+
+def test_regular_preemption_still_frees_kv_without_prefix_caching(tmp_path):
+    model = _make_local_test_model(tmp_path)
+    scheduler = create_scheduler(
+        model=model,
+        max_num_batched_tokens=100,
+        block_size=16,
+        num_blocks=11,
+        enable_prefix_caching=False,
+        skip_tokenizer_init=True,
+    )
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=80,
+        block_size=16,
+    )
+
+    scheduler.add_request(request)
+    _ = scheduler.schedule()
+
+    assert request.num_computed_tokens == 80
+    assert scheduler.kv_cache_manager.get_block_ids(request.request_id) is not None
+
+    scheduler.running.remove(request)
+    scheduler._preempt_request(request, timestamp=0.0)
+
+    assert request.status == RequestStatus.PREEMPTED
+    assert request.num_computed_tokens == 0
+    assert all(
+        not block_ids
+        for block_ids in scheduler.kv_cache_manager.get_block_ids(request.request_id)
+    )
+
+
+def test_online_prefill_preemption_preserves_kv_without_prefix_caching(tmp_path):
+    model = _make_local_test_model(tmp_path)
+    scheduler = create_scheduler(
+        model=model,
+        max_num_batched_tokens=100,
+        block_size=16,
+        num_blocks=11,
+        enable_prefix_caching=False,
+        enable_online_prefill=True,
+        skip_tokenizer_init=True,
+    )
+    scheduler.scheduler_config.online_prefill_chunk_size = 80
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=80,
+        block_size=16,
+        req_ids=["online"],
+        resumable=True,
+        online_prefill_enabled=True,
+    )
+
+    scheduler.add_request(request)
+    _ = scheduler.schedule()
+
+    original_block_ids = scheduler.kv_cache_manager.get_block_ids(request.request_id)
+    assert original_block_ids is not None
+    assert request.num_computed_tokens == 80
+
+    scheduler.running.remove(request)
+    scheduler._preempt_request(
+        request,
+        timestamp=0.0,
+        preserve_kv_cache=scheduler._should_preserve_kv_cache_on_preemption(request),
+    )
+
+    assert request.status == RequestStatus.PREEMPTED
+    assert request.num_computed_tokens == 80
+    assert scheduler.kv_cache_manager.get_block_ids(request.request_id) == original_block_ids
+
+
+def test_online_prefill_running_request_is_not_preempted_when_prefix_caching_disabled(
+    tmp_path,
+):
+    model = _make_local_test_model(tmp_path)
+    scheduler = create_scheduler(
+        model=model,
+        max_num_batched_tokens=100,
+        block_size=16,
+        num_blocks=11,
+        enable_prefix_caching=False,
+        enable_online_prefill=True,
+        skip_tokenizer_init=True,
+    )
+    scheduler.scheduler_config.online_prefill_chunk_size = 80
+    (normal_request,) = create_requests(num_requests=1, num_tokens=80, block_size=16)
+    (online_request,) = create_requests(
+        num_requests=1,
+        num_tokens=80,
+        block_size=16,
+        req_ids=["online"],
+        resumable=True,
+        online_prefill_enabled=True,
+    )
+
+    scheduler.add_request(normal_request)
+    scheduler_output0 = scheduler.schedule()
+    scheduler.add_request(online_request)
+    scheduler_output1 = scheduler.schedule()
+
+    model_runner_output0 = ModelRunnerOutput(
+        req_ids=[normal_request.request_id],
+        req_id_to_index={normal_request.request_id: 0},
+        sampled_token_ids=[[0]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    scheduler.update_from_output(scheduler_output0, model_runner_output0)
+
+    _ = scheduler.schedule()
+
+    assert online_request.status == RequestStatus.RUNNING
+    assert online_request.num_computed_tokens == 80
+    assert normal_request.status == RequestStatus.PREEMPTED
+    assert scheduler.kv_cache_manager.get_block_ids(online_request.request_id) is not None
+
+    model_runner_output1 = ModelRunnerOutput(
+        req_ids=[online_request.request_id],
+        req_id_to_index={online_request.request_id: 0},
+        sampled_token_ids=[[42]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    scheduler.update_from_output(scheduler_output1, model_runner_output1)
+    assert online_request.output_token_ids[0] == 42
 
 
 def test_scheduler_reset_prefix_cache():

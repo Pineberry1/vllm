@@ -482,7 +482,7 @@ class AsyncLLM(EngineClient):
                         frame_token_sizes=input_chunk.frame_token_sizes,
                         **inputs,  # type: ignore[arg-type]
                     )
-                    logger.info(
+                    logger.debug(
                         "online_prefill input_chunk external_request_id=%s internal_request_id=%s stream_end=%s online_prefill=%s prompt_tokens=%s frame_spans=%s",
                         request_id,
                         internal_req_id,
