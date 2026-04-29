@@ -275,6 +275,9 @@ def compute_tri_state_folding(
     output_embeds: list[torch.Tensor] = []
     output_rep_indices: list[int] = []
     output_source_counts: list[int] = []
+    represented_mask = torch.zeros(
+        num_tokens, device=video_embeds.device, dtype=torch.bool
+    )
 
     for block, budget in zip(blocks, budgets):
         block_indices = block.token_indices
@@ -287,6 +290,7 @@ def compute_tri_state_folding(
             for local_idx in range(block_size):
                 rep_index = int(block_indices[local_idx].item())
                 token_state[rep_index] = _TOKEN_KEEP
+                represented_mask[rep_index] = True
                 output_rep_indices.append(rep_index)
                 output_embeds.append(block_embeds[local_idx])
                 output_source_counts.append(1)
@@ -300,6 +304,7 @@ def compute_tri_state_folding(
         for local_idx in sorted(keep_local_indices, key=lambda i: int(block_indices[i])):
             rep_index = int(block_indices[local_idx].item())
             token_state[rep_index] = _TOKEN_KEEP
+            represented_mask[rep_index] = True
             output_rep_indices.append(rep_index)
             output_embeds.append(block_embeds[local_idx])
             output_source_counts.append(1)
@@ -332,6 +337,9 @@ def compute_tri_state_folding(
             rep_local = int(cluster_tensor[medoid_pos].item())
             rep_index = int(block_indices[rep_local].item())
             token_state[rep_index] = _TOKEN_MERGE
+            represented_mask.index_fill_(
+                0, block_indices.index_select(0, cluster_tensor), True
+            )
             output_rep_indices.append(rep_index)
             output_embeds.append(cluster_embeds.mean(dim=0).to(video_embeds.dtype))
             output_source_counts.append(len(cluster_local))
@@ -342,10 +350,10 @@ def compute_tri_state_folding(
     for output_idx, rep_index in enumerate(output_rep_indices):
         outputs_by_frame[rep_index // tokens_per_frame].append(output_idx)
 
-    represented = sum(output_source_counts)
+    represented = int(represented_mask.sum().item())
     if represented < num_tokens:
         for token_index in range(num_tokens):
-            if token_state[token_index] != _TOKEN_DROP:
+            if bool(represented_mask[token_index]):
                 continue
             frame_idx = token_index // tokens_per_frame
             frame_outputs = outputs_by_frame[frame_idx]
