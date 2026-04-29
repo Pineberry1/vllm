@@ -310,6 +310,9 @@ class ModelConfig:
     interleave_mm_strings: InitVar[bool | None] = None
     skip_mm_profiling: InitVar[bool | None] = None
     video_pruning_rate: InitVar[float | None] = None
+    visual_token_merger_alpha: InitVar[float | None] = None
+    visual_token_merger_block_t: InitVar[int | None] = None
+    visual_token_merger_block_hw: InitVar[int | None] = None
 
     def compute_hash(self) -> str:
         """
@@ -612,6 +615,9 @@ class ModelConfig:
                 interleave_mm_strings=interleave_mm_strings,
                 skip_mm_profiling=skip_mm_profiling,
                 video_pruning_rate=video_pruning_rate,
+                visual_token_merger_alpha=visual_token_merger_alpha,
+                visual_token_merger_block_t=visual_token_merger_block_t,
+                visual_token_merger_block_hw=visual_token_merger_block_hw,
             )
 
             mm_config_kwargs = {

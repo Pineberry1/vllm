@@ -172,6 +172,12 @@ class MultiModalConfig:
     Value sits in range [0;1) and determines fraction of media tokens
     from each video to be pruned.
     """
+    visual_token_merger_alpha: float | None = Field(default=None, gt=0.0, le=1.0)
+    """Target visual token retention ratio for tri-state video token folding."""
+    visual_token_merger_block_t: int = Field(default=1, ge=1)
+    """Temporal block size for tri-state video token folding."""
+    visual_token_merger_block_hw: int = Field(default=2, ge=1)
+    """Spatial block side length for tri-state video token folding."""
 
     @field_validator("limit_per_prompt", mode="before")
     @classmethod
@@ -227,6 +233,26 @@ class MultiModalConfig:
                 "'mm_shm_cache_max_object_size_mb' should only be set when "
                 "'mm_processor_cache_type' is 'shm'."
             )
+
+        mm_processor_kwargs = self.mm_processor_kwargs or {}
+        if self.visual_token_merger_alpha is None:
+            alpha = mm_processor_kwargs.get("visual_token_merger_alpha")
+            if alpha is not None:
+                self.visual_token_merger_alpha = float(alpha)
+        if "visual_token_merger_block_t" in mm_processor_kwargs:
+            self.visual_token_merger_block_t = int(
+                mm_processor_kwargs["visual_token_merger_block_t"]
+            )
+        if "visual_token_merger_block_hw" in mm_processor_kwargs:
+            self.visual_token_merger_block_hw = int(
+                mm_processor_kwargs["visual_token_merger_block_hw"]
+            )
+
+        if self.is_multimodal_pruning_enabled() and self.is_visual_token_merger_enabled():
+            raise ValueError(
+                "video_pruning_rate and visual_token_merger_alpha are mutually "
+                "exclusive. Configure only one video token reduction method."
+            )
         return self
 
     def compute_hash(self) -> str:
@@ -279,3 +305,9 @@ class MultiModalConfig:
 
     def is_multimodal_pruning_enabled(self):
         return self.video_pruning_rate is not None and self.video_pruning_rate > 0
+
+    def is_visual_token_merger_enabled(self) -> bool:
+        return (
+            self.visual_token_merger_alpha is not None
+            and 0.0 < self.visual_token_merger_alpha < 1.0
+        )
