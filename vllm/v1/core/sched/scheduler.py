@@ -1612,6 +1612,7 @@ class Scheduler(SchedulerInterface):
                     request.decode_blocked_until_stream_end = False
                     request.pending_stream_flush = False
                     request.discard_deferred_output_tokens()
+                    self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)  # BAVA_PATCH: sync KV manager before cap (mirror upstream :2486)
                     if request.num_computed_tokens >= request.num_tokens and request.num_tokens > 0:
                         request.num_computed_tokens = request.num_tokens - 1
                     logger.info(
@@ -1896,6 +1897,7 @@ class Scheduler(SchedulerInterface):
             and request.online_stream_ended
             and request.get_unprefilled_prompt_len() > 0
         ):
+            request.discard_deferred_output_tokens()
             request.decode_blocked_until_stream_end = True
             request.pending_stream_flush = True
             logger.info(
@@ -1919,6 +1921,7 @@ class Scheduler(SchedulerInterface):
             and request.num_output_tokens == 0
         ):
             request.num_output_placeholders = max(request.num_output_placeholders, 1)
+            self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)  # BAVA_PATCH: sync KV manager before cap (mirror upstream :2486)
             if request.num_computed_tokens >= request.num_tokens and request.num_tokens > 0:
                 request.num_computed_tokens = request.num_tokens - 1
             logger.info(
