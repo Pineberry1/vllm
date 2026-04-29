@@ -433,6 +433,9 @@ class ModelConfig:
         interleave_mm_strings: bool | None,
         skip_mm_profiling: bool | None,
         video_pruning_rate: float | None,
+        visual_token_merger_alpha: float | None,
+        visual_token_merger_block_t: int | None,
+        visual_token_merger_block_hw: int | None,
     ) -> None:
         # Keep set served_model_name before maybe_model_redirect(self.model)
         self.served_model_name = get_served_model_name(
