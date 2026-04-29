@@ -1,12 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import importlib.util
 import math
+from pathlib import Path
 
 import pytest
 import torch
 
-from vllm.multimodal.tri_state_merger import compute_tri_state_folding
+
+_MODULE_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "vllm"
+    / "multimodal"
+    / "tri_state_merger.py"
+)
+_SPEC = importlib.util.spec_from_file_location("tri_state_merger", _MODULE_PATH)
+assert _SPEC is not None and _SPEC.loader is not None
+_TRI_STATE_MERGER = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(_TRI_STATE_MERGER)
+compute_tri_state_folding = _TRI_STATE_MERGER.compute_tri_state_folding
 
 
 def test_alpha_1_is_identity():
