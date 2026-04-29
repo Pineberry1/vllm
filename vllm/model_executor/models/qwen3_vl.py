@@ -2290,6 +2290,16 @@ class Qwen3VLForConditionalGeneration(
         mrope_position_delta = (llm_positions.max() + 1 - len(input_tokens)).item()
         return torch.from_numpy(llm_positions), mrope_position_delta
 
+    def has_multimodal_position_info(
+        self,
+        multimodal_embeddings: MultiModalEmbeddings,
+    ) -> bool:
+        expected_width = self.visual_dim * (1 + self.deepstack_num_level) + 5
+        return any(
+            mm.ndim == 2 and mm.shape[-1] == expected_width
+            for mm in multimodal_embeddings
+        )
+
     def recompute_mrope_positions(
         self,
         input_ids: list[int],
