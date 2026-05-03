@@ -527,6 +527,13 @@ class EngineArgs:
     ignore_patterns: str | list[str] = get_field(LoadConfig, "ignore_patterns")
     enable_online_prefill: bool | None = None
     online_prefill_chunk_size: int = SchedulerConfig.online_prefill_chunk_size
+    enable_online_prefill_early_finalizer: bool | None = None
+    online_prefill_early_finalize_min_tokens: int = (
+        SchedulerConfig.online_prefill_early_finalize_min_tokens
+    )
+    online_prefill_early_finalize_kv_usage_threshold: float = (
+        SchedulerConfig.online_prefill_early_finalize_kv_usage_threshold
+    )
     enable_chunked_prefill: bool | None = None
     disable_chunked_mm_input: bool = SchedulerConfig.disable_chunked_mm_input
 
@@ -1228,6 +1235,23 @@ class EngineArgs:
             **scheduler_kwargs["online_prefill_chunk_size"],
         )
         scheduler_group.add_argument(
+            "--enable-online-prefill-early-finalizer",
+            **{
+                **scheduler_kwargs["enable_online_prefill_early_finalizer"],
+                "default": None,
+            },
+        )
+        scheduler_group.add_argument(
+            "--online-prefill-early-finalize-min-tokens",
+            **scheduler_kwargs["online_prefill_early_finalize_min_tokens"],
+        )
+        scheduler_group.add_argument(
+            "--online-prefill-early-finalize-kv-usage-threshold",
+            **scheduler_kwargs[
+                "online_prefill_early_finalize_kv_usage_threshold"
+            ],
+        )
+        scheduler_group.add_argument(
             "--enable-chunked-prefill",
             **{
                 **scheduler_kwargs["enable_chunked_prefill"],
@@ -1796,6 +1820,8 @@ class EngineArgs:
         assert self.max_num_seqs is not None, "max_num_seqs must be set by this point"
         if self.enable_online_prefill is None:
             self.enable_online_prefill = False
+        if self.enable_online_prefill_early_finalizer is None:
+            self.enable_online_prefill_early_finalizer = False
         assert self.enable_chunked_prefill is not None, (
             "enable_chunked_prefill must be set by this point"
         )
@@ -1809,6 +1835,15 @@ class EngineArgs:
             max_model_len=model_config.max_model_len,
             enable_online_prefill=self.enable_online_prefill,
             online_prefill_chunk_size=self.online_prefill_chunk_size,
+            enable_online_prefill_early_finalizer=(
+                self.enable_online_prefill_early_finalizer
+            ),
+            online_prefill_early_finalize_min_tokens=(
+                self.online_prefill_early_finalize_min_tokens
+            ),
+            online_prefill_early_finalize_kv_usage_threshold=(
+                self.online_prefill_early_finalize_kv_usage_threshold
+            ),
             enable_chunked_prefill=self.enable_chunked_prefill,
             disable_chunked_mm_input=self.disable_chunked_mm_input,
             is_multimodal_model=model_config.is_multimodal_model,

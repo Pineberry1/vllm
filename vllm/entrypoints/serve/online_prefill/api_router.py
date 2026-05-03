@@ -76,6 +76,7 @@ class OnlinePrefillSessionResponse(BaseModel):
     appended_chunks: int
     appended_frames: int
     stream_end_received: bool
+    early_finalized: bool = False
     decode_started: bool
     finished: bool
     output_text: str | None = None
@@ -97,6 +98,8 @@ class _OnlinePrefillSession:
     appended_chunks: int = 0
     appended_frames: int = 0
     stream_end_received: bool = False
+    early_finalized: bool = False
+    early_finalize_close_sent: bool = False
     decode_started: bool = False
     finished: bool = False
     output_text: str | None = None
@@ -164,6 +167,8 @@ class OnlinePrefillSessionManager:
         append_request: OnlinePrefillAppendRequest,
     ) -> _OnlinePrefillSession:
         session = await self.get_session(request_id)
+        if session.early_finalized:
+            raise HTTPException(status_code=409, detail="session was early_finalized")
         if session.finished:
             raise HTTPException(status_code=409, detail="session already finished")
         if session.stream_end_received:
@@ -214,6 +219,8 @@ class OnlinePrefillSessionManager:
             while True:
                 item = await session.queue.get()
                 if item is _STREAM_DONE:
+                    return
+                if session.early_finalized:
                     return
                 if isinstance(item, StreamingInput):
                     yield item
@@ -273,6 +280,7 @@ class OnlinePrefillSessionManager:
 
                 prefix_text = session.prefix_text if not session.input_started else ""
                 suffix_text = session.suffix_text if stream_end else ""
+                finalize_suffix_text = "" if stream_end else session.suffix_text
 
                 if queued_frames or prefix_text or suffix_text:
                     streaming_input, prompt_token_count = await asyncio.to_thread(
@@ -281,6 +289,7 @@ class OnlinePrefillSessionManager:
                         prefix_text=prefix_text,
                         suffix_text=suffix_text,
                         stream_end=stream_end,
+                        finalize_suffix_text=finalize_suffix_text,
                     )
                     session.prompt_token_counts.append(prompt_token_count)
                     session.input_started = True
@@ -318,7 +327,14 @@ class OnlinePrefillSessionManager:
         output: RequestOutput,
     ) -> None:
         session.updated_at = time.time()
-        if session.stream_end_received:
+        if output.early_finalized:
+            session.early_finalized = True
+            session.decode_started = True
+            session.status = "early_finalized"
+            if not session.early_finalize_close_sent:
+                session.early_finalize_close_sent = True
+                session.queue.put_nowait(_STREAM_DONE)
+        elif session.stream_end_received:
             session.decode_started = True
             session.status = "decoding"
         elif session.status != "waiting_for_decode":
@@ -340,9 +356,10 @@ class OnlinePrefillSessionManager:
             )
         if output.finished:
             logger.info(
-                "online_prefill api_finished request_id=%s output_text_present=%s",
+                "online_prefill api_finished request_id=%s output_text_present=%s early_finalized=%s",
                 session.request_id,
                 bool(session.output_text),
+                session.early_finalized,
             )
             session.finished = True
             session.status = "finished"
@@ -370,6 +387,7 @@ class OnlinePrefillSessionManager:
         prefix_text: str = "",
         suffix_text: str = "",
         stream_end: bool = False,
+        finalize_suffix_text: str = "",
     ) -> tuple[StreamingInput, int]:
         images = [self._decode_frame(frame) for frame in frames]
         prompt, frame_token_sizes = self._preprocess_prompt(
@@ -377,12 +395,17 @@ class OnlinePrefillSessionManager:
             prefix_text=prefix_text,
             suffix_text=suffix_text,
         )
+        finalize_token_ids = None
+        if finalize_suffix_text:
+            finalize_prompt = self._preprocess_text_prompt(finalize_suffix_text)
+            finalize_token_ids = self._prompt_token_ids(finalize_prompt)
         return (
             StreamingInput(
                 prompt=prompt,
                 online_prefill_enabled=True,
                 stream_end=stream_end,
                 frame_token_sizes=frame_token_sizes,
+                online_prefill_finalize_token_ids=finalize_token_ids,
             ),
             self._prompt_token_count(prompt),
         )
@@ -451,11 +474,15 @@ class OnlinePrefillSessionManager:
         return image.convert("RGB")
 
     @staticmethod
-    def _prompt_token_count(prompt: ProcessorInputs) -> int:
+    def _prompt_token_ids(prompt: ProcessorInputs) -> list[int]:
         _, decoder_inputs = split_enc_dec_inputs(prompt)
         if decoder_inputs["type"] == "embeds":
-            return int(decoder_inputs["prompt_embeds"].shape[0])
-        return len(decoder_inputs["prompt_token_ids"])
+            return [0] * int(decoder_inputs["prompt_embeds"].shape[0])
+        return list(decoder_inputs["prompt_token_ids"])
+
+    @staticmethod
+    def _prompt_token_count(prompt: ProcessorInputs) -> int:
+        return len(OnlinePrefillSessionManager._prompt_token_ids(prompt))
 
 
 def _get_manager(raw_request: Request) -> OnlinePrefillSessionManager:
@@ -484,6 +511,7 @@ def _to_response(session: _OnlinePrefillSession) -> OnlinePrefillSessionResponse
         appended_chunks=session.appended_chunks,
         appended_frames=session.appended_frames,
         stream_end_received=session.stream_end_received,
+        early_finalized=session.early_finalized,
         decode_started=session.decode_started,
         finished=session.finished,
         output_text=session.output_text,

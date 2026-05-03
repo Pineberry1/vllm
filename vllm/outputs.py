@@ -121,6 +121,7 @@ class RequestOutput:
         num_cached_tokens: int | None = None,
         *,
         kv_transfer_params: dict[str, Any] | None = None,
+        early_finalized: bool = False,
         # Forward compatibility, code that uses args added in new release can
         # still run with older versions of vLLM without breaking.
         **kwargs: Any,
@@ -141,11 +142,13 @@ class RequestOutput:
         self.encoder_prompt_token_ids = encoder_prompt_token_ids
         self.num_cached_tokens = num_cached_tokens
         self.kv_transfer_params = kv_transfer_params
+        self.early_finalized = early_finalized
 
     def add(self, next_output: "RequestOutput", aggregate: bool) -> None:
         """Merge subsequent RequestOutput into this one"""
 
         self.finished |= next_output.finished
+        self.early_finalized |= next_output.early_finalized
         self.kv_transfer_params = next_output.kv_transfer_params
 
         for next_completion in next_output.outputs:
@@ -182,6 +185,7 @@ class RequestOutput:
             f"prompt_logprobs={self.prompt_logprobs}, "
             f"outputs={self.outputs}, "
             f"finished={self.finished}, "
+            f"early_finalized={self.early_finalized}, "
             f"metrics={self.metrics}, "
             f"lora_request={self.lora_request}, "
             f"num_cached_tokens={self.num_cached_tokens})"

@@ -89,6 +89,21 @@ class SchedulerConfig:
     an online-prefill request is scheduled for a new prefill chunk (the q
     parameter in the online prefill design). Actual chunk boundaries are
     aligned to frame boundaries when frame_token_sizes is provided."""
+    enable_online_prefill_early_finalizer: bool = False
+    """If True, allow the scheduler to early-finalize appending online-prefill
+    requests under KV pressure instead of fully preempting them."""
+    online_prefill_early_finalize_min_tokens: int = Field(default=0, ge=0)
+    """Minimum number of prompt tokens that must be prefilled before an
+    online-prefill request can be early-finalized. A value of 0 falls back to
+    online_prefill_chunk_size."""
+    online_prefill_early_finalize_kv_usage_threshold: float = Field(
+        default=0.9, ge=0.0, le=1.0
+    )
+    """KV cache usage fraction at which the early-finalizer may engage.
+
+    For example, 0.9 means early-finalizer checks start once the KV cache is
+    at 90% usage or above.
+    """
     enable_chunked_prefill: bool = True
     """If True, prefill requests can be chunked based
     on the remaining `max_num_batched_tokens`.
@@ -239,6 +254,14 @@ class SchedulerConfig:
             logger.info_once(
                 "Online prefill is enabled with chunk_size=%d.",
                 self.online_prefill_chunk_size,
+                scope="local",
+            )
+        if self.enable_online_prefill_early_finalizer:
+            logger.info_once(
+                "Online prefill early finalizer is enabled with min_tokens=%d.",
+                self.online_prefill_early_finalize_min_tokens
+                if self.online_prefill_early_finalize_min_tokens > 0
+                else self.online_prefill_chunk_size,
                 scope="local",
             )
         if self.enable_chunked_prefill:

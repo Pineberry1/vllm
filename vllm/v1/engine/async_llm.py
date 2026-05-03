@@ -480,6 +480,9 @@ class AsyncLLM(EngineClient):
                         online_prefill_enabled=input_chunk.online_prefill_enabled,
                         stream_end=input_chunk.stream_end,
                         frame_token_sizes=input_chunk.frame_token_sizes,
+                        online_prefill_finalize_token_ids=(
+                            input_chunk.online_prefill_finalize_token_ids
+                        ),
                         **inputs,  # type: ignore[arg-type]
                     )
                     logger.debug(

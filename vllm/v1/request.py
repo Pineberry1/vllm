@@ -44,6 +44,7 @@ class StreamingUpdate:
     online_prefill_enabled: bool = False
     stream_end: bool = False
     frame_token_sizes: list[int] | None = None
+    online_prefill_finalize_token_ids: list[int] | None = None
 
     @classmethod
     def from_request(cls, request: "Request") -> "StreamingUpdate | None":
@@ -58,6 +59,9 @@ class StreamingUpdate:
             online_prefill_enabled=request.is_online_prefill_request,
             stream_end=request.online_stream_ended,
             frame_token_sizes=request.frame_token_sizes,
+            online_prefill_finalize_token_ids=(
+                request.online_prefill_finalize_token_ids
+            ),
         )
 
 
@@ -82,6 +86,7 @@ class Request:
         online_prefill_enabled: bool = False,
         stream_end: bool = False,
         frame_token_sizes: list[int] | None = None,
+        online_prefill_finalize_token_ids: list[int] | None = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -184,6 +189,11 @@ class Request:
         self.streaming_queue: deque[StreamingUpdate | None] | None = None
         self.frame_token_sizes = frame_token_sizes
         self.is_online_prefill_request = resumable and online_prefill_enabled
+        self.online_prefill_finalize_token_ids = (
+            list(online_prefill_finalize_token_ids)
+            if online_prefill_finalize_token_ids
+            else None
+        )
 
         self.skip_reading_prefix_cache = self.get_skip_reading_prefix_cache()
         # Overridden by Scheduler.add_request with the value from SchedulerConfig.
@@ -193,6 +203,7 @@ class Request:
         self.num_prompt_tokens_received = self.num_prompt_tokens
         self.num_prompt_tokens_prefilled = 0
         self.pending_stream_flush = False
+        self.early_finalized = False
         self.deferred_output_token_ids: list[int] = []
         self.online_frame_end_positions: list[int] = []
         if self.is_online_prefill_request:
@@ -228,6 +239,9 @@ class Request:
             online_prefill_enabled=request.online_prefill_enabled,
             stream_end=request.stream_end,
             frame_token_sizes=request.frame_token_sizes,
+            online_prefill_finalize_token_ids=(
+                request.online_prefill_finalize_token_ids
+            ),
         )
 
     def _append_online_frame_end_positions(
@@ -251,6 +265,123 @@ class Request:
         for frame_size in frame_token_sizes:
             running_end += frame_size
             self.online_frame_end_positions.append(running_end)
+
+    def _early_finalize_boundary(
+        self,
+        max_prompt_tokens: int | None = None,
+    ) -> int | None:
+        if (
+            not self.is_online_prefill_request
+            or self.online_stream_ended
+            or self.num_computed_tokens <= 0
+        ):
+            return None
+
+        suffix_len = len(self.online_prefill_finalize_token_ids or ())
+        max_boundary = None
+        if max_prompt_tokens is not None:
+            max_boundary = max_prompt_tokens - suffix_len
+            if max_boundary <= 0:
+                return None
+
+        boundary = min(
+            self.num_computed_tokens,
+            self.num_prompt_tokens_received,
+            self.num_prompt_tokens,
+        )
+        if max_boundary is not None:
+            boundary = min(boundary, max_boundary)
+        if self.online_frame_end_positions:
+            boundary = 0
+            for frame_end in self.online_frame_end_positions:
+                if frame_end <= self.num_computed_tokens and (
+                    max_boundary is None or frame_end <= max_boundary
+                ):
+                    boundary = frame_end
+                else:
+                    break
+
+        return boundary if boundary > 0 else None
+
+    def _can_truncate_mm_features(self, boundary: int) -> bool:
+        for mm_feature in self.mm_features:
+            start = mm_feature.mm_position.offset
+            end = start + mm_feature.mm_position.length
+            if start < boundary < end:
+                return False
+        return True
+
+    def can_early_finalize(
+        self,
+        min_prompt_tokens: int,
+        max_prompt_tokens: int | None = None,
+    ) -> bool:
+        boundary = self._early_finalize_boundary(
+            max_prompt_tokens=max_prompt_tokens,
+        )
+        return (
+            boundary is not None
+            and boundary >= min_prompt_tokens
+            and self._can_truncate_mm_features(boundary)
+        )
+
+    def mark_early_finalized(
+        self,
+        min_prompt_tokens: int,
+        max_prompt_tokens: int | None = None,
+    ) -> bool:
+        if self.early_finalized:
+            return True
+
+        self.discard_deferred_output_tokens()
+        boundary = self._early_finalize_boundary(
+            max_prompt_tokens=max_prompt_tokens,
+        )
+        if (
+            boundary is None
+            or boundary < min_prompt_tokens
+            or not self._can_truncate_mm_features(boundary)
+        ):
+            return False
+
+        assert self.prompt_token_ids is not None
+        del self.prompt_token_ids[boundary:]
+        del self._all_token_ids[boundary:]
+        self.num_prompt_tokens = boundary
+        self.num_prompt_tokens_received = boundary
+        self.num_computed_tokens = min(self.num_computed_tokens, boundary)
+        self.num_prompt_tokens_prefilled = boundary
+        self.online_frame_end_positions = [
+            frame_end
+            for frame_end in self.online_frame_end_positions
+            if frame_end <= boundary
+        ]
+        self.mm_features = [
+            mm_feature
+            for mm_feature in self.mm_features
+            if mm_feature.mm_position.offset + mm_feature.mm_position.length
+            <= boundary
+        ]
+
+        suffix_token_ids = self.online_prefill_finalize_token_ids or []
+        if suffix_token_ids:
+            self.prompt_token_ids.extend(suffix_token_ids)
+            self._all_token_ids.extend(suffix_token_ids)
+            self.num_prompt_tokens = len(self.prompt_token_ids)
+            self.num_prompt_tokens_received = self.num_prompt_tokens
+
+        self.early_finalized = True
+        self.mark_stream_end()
+        if self.get_unprefilled_prompt_len() == 0:
+            self.decode_blocked_until_stream_end = False
+            self.pending_stream_flush = False
+            self.num_output_placeholders = max(self.num_output_placeholders, 1)
+        else:
+            self.decode_blocked_until_stream_end = True
+            self.pending_stream_flush = True
+        self.num_cached_tokens = -1
+        self.rebuild_block_hashes()
+        return True
 
     def rebuild_block_hashes(self) -> None:
         self.block_hashes = []

@@ -1,9 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+
 import torch
 
-from tests.v1.kv_connector.unit.utils import MockKVConfig
 from vllm.config import (
     CacheConfig,
     ECTransferConfig,
@@ -35,8 +39,136 @@ from vllm.v1.structured_output import StructuredOutputManager
 EOS_TOKEN_ID = 50256
 
 
+@dataclass(frozen=True)
+class MockKVConfig:
+    matched_tokens: int
+    is_async: bool
+
+
 def mock_kv(matched_tokens: int, is_async: bool):
     return MockKVConfig(matched_tokens=matched_tokens, is_async=is_async)
+
+
+def _ensure_local_dummy_model(name: str, config: dict) -> str:
+    model_dir = Path(tempfile.gettempdir()) / name
+    model_dir.mkdir(parents=True, exist_ok=True)
+    config_path = model_dir / "config.json"
+    if not config_path.exists():
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+    return str(model_dir)
+
+
+def _dummy_text_model() -> str:
+    return _ensure_local_dummy_model(
+        "vllm_scheduler_dummy_gpt2",
+        {
+            "architectures": ["GPT2LMHeadModel"],
+            "model_type": "gpt2",
+            "vocab_size": 128,
+            "n_positions": 1024,
+            "n_ctx": 1024,
+            "n_embd": 32,
+            "n_layer": 2,
+            "n_head": 2,
+            "bos_token_id": 0,
+            "eos_token_id": 1,
+        },
+    )
+
+
+def _dummy_multimodal_model() -> str:
+    model_dir = Path(tempfile.gettempdir()) / "vllm_scheduler_dummy_llava"
+    model_dir.mkdir(parents=True, exist_ok=True)
+    (model_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "llava",
+                "architectures": ["LlavaForConditionalGeneration"],
+                "image_token_index": 4,
+                "projector_hidden_act": "gelu",
+                "vision_feature_select_strategy": "default",
+                "vision_feature_layer": -2,
+                "ignore_index": -100,
+                "text_config": {
+                    "model_type": "llama",
+                    "architectures": ["LlamaForCausalLM"],
+                    "hidden_size": 32,
+                    "intermediate_size": 64,
+                    "num_hidden_layers": 2,
+                    "num_attention_heads": 2,
+                    "num_key_value_heads": 2,
+                    "vocab_size": 128,
+                    "max_position_embeddings": 2048,
+                    "rms_norm_eps": 1e-6,
+                    "bos_token_id": 2,
+                    "eos_token_id": 3,
+                },
+                "vision_config": {
+                    "model_type": "clip_vision_model",
+                    "hidden_size": 32,
+                    "intermediate_size": 64,
+                    "num_hidden_layers": 2,
+                    "num_attention_heads": 2,
+                    "image_size": 336,
+                    "patch_size": 14,
+                    "num_channels": 3,
+                    "projection_dim": 32,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import Whitespace
+    from transformers import CLIPImageProcessor, PreTrainedTokenizerFast
+
+    tokenizer = Tokenizer(
+        WordLevel(
+            {
+                "<unk>": 0,
+                "<pad>": 1,
+                "<bos>": 2,
+                "<eos>": 3,
+                "<image>": 4,
+                "hello": 5,
+            },
+            unk_token="<unk>",
+        )
+    )
+    tokenizer.pre_tokenizer = Whitespace()
+    fast_tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=tokenizer,
+        unk_token="<unk>",
+        pad_token="<pad>",
+        bos_token="<bos>",
+        eos_token="<eos>",
+        additional_special_tokens=["<image>"],
+    )
+    fast_tokenizer.save_pretrained(model_dir)
+
+    image_processor = CLIPImageProcessor(
+        do_resize=True,
+        size={"shortest_edge": 336},
+        do_center_crop=True,
+        crop_size={"height": 336, "width": 336},
+        do_rescale=True,
+        rescale_factor=1 / 255,
+        do_normalize=True,
+        image_mean=[0.48145466, 0.4578275, 0.40821073],
+        image_std=[0.26862954, 0.26130258, 0.27577711],
+    )
+    image_processor.save_pretrained(model_dir)
+    return str(model_dir)
+
+
+def resolve_test_model(model: str) -> tuple[str, bool]:
+    if model == "facebook/opt-125m":
+        return _dummy_text_model(), True
+    if model == "llava-hf/llava-1.5-7b-hf":
+        return _dummy_multimodal_model(), False
+    return model, False
 
 
 def create_scheduler(
@@ -58,6 +190,9 @@ def create_scheduler(
     use_ec_connector: bool = False,
     ec_role: str | None = None,
     enable_online_prefill: bool = False,
+    enable_online_prefill_early_finalizer: bool = False,
+    online_prefill_early_finalize_min_tokens: int = 0,
+    online_prefill_early_finalize_kv_usage_threshold: float = 0.9,
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
@@ -72,6 +207,8 @@ def create_scheduler(
     Returns:
       {class}`Scheduler` instance
     """
+    model, force_skip_tokenizer_init = resolve_test_model(model)
+    skip_tokenizer_init = skip_tokenizer_init or force_skip_tokenizer_init
     model_config = ModelConfig(
         model=model,
         trust_remote_code=True,
@@ -88,6 +225,15 @@ def create_scheduler(
         long_prefill_token_threshold=long_prefill_token_threshold,
         disable_chunked_mm_input=disable_chunked_mm_input,
         enable_online_prefill=enable_online_prefill,
+        enable_online_prefill_early_finalizer=(
+            enable_online_prefill_early_finalizer
+        ),
+        online_prefill_early_finalize_min_tokens=(
+            online_prefill_early_finalize_min_tokens
+        ),
+        online_prefill_early_finalize_kv_usage_threshold=(
+            online_prefill_early_finalize_kv_usage_threshold
+        ),
         enable_chunked_prefill=enable_chunked_prefill,
         async_scheduling=async_scheduling,
         is_encoder_decoder=model_config.is_encoder_decoder,
@@ -104,6 +250,7 @@ def create_scheduler(
         kv_transfer_config = KVTransferConfig(
             kv_connector="MockKVConnector",
             kv_role="kv_both",
+            kv_connector_module_path="tests.v1.kv_connector.unit.utils",
             kv_connector_extra_config={
                 "matched_tokens": use_kv_connector.matched_tokens,
                 "is_async": use_kv_connector.is_async,
@@ -191,6 +338,7 @@ def create_requests(
     online_prefill_enabled: bool = False,
     stream_end: bool = False,
     frame_token_sizes: list[list[int] | None] | None = None,
+    online_prefill_finalize_token_ids: list[list[int] | None] | None = None,
 ) -> list[Request]:
     global _none_hash_initialized
     if not _none_hash_initialized:
@@ -268,6 +416,11 @@ def create_requests(
             stream_end=stream_end,
             frame_token_sizes=(
                 frame_token_sizes[i] if frame_token_sizes is not None else None
+            ),
+            online_prefill_finalize_token_ids=(
+                online_prefill_finalize_token_ids[i]
+                if online_prefill_finalize_token_ids is not None
+                else None
             ),
         )
         requests.append(request)

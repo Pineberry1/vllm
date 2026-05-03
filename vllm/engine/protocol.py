@@ -39,6 +39,7 @@ class StreamingInput:
     online_prefill_enabled: bool = False
     stream_end: bool = False
     frame_token_sizes: list[int] | None = None
+    online_prefill_finalize_token_ids: list[int] | None = None
 
 
 class EngineClient(ABC):

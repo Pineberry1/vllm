@@ -95,6 +95,7 @@ class EngineCoreRequest(
     online_prefill_enabled: bool = False
     stream_end: bool = False
     frame_token_sizes: list[int] | None = None
+    online_prefill_finalize_token_ids: list[int] | None = None
 
     # The user-provided request ID. This field is set internally,
     # copied from the provided request_id that's originally assigned
@@ -165,6 +166,7 @@ class EngineCoreOutput(
     # The number of tokens computed remotely (original count from connector).
     num_external_computed_tokens: int = 0
     routed_experts: np.ndarray | None = None
+    early_finalized: bool = False
     # The number of NaNs in logits.
     # A value greater than 0 indicates that the output is corrupted.
     num_nans_in_logits: int = 0

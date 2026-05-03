@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import json
 import dataclasses
-from unittest.mock import Mock
+from unittest.mock import ANY, Mock
 
 import pytest
 import torch
@@ -36,7 +36,13 @@ from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
-from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
+from .utils import (
+    EOS_TOKEN_ID,
+    create_requests,
+    create_scheduler,
+    mock_kv,
+    resolve_test_model,
+)
 
 pytestmark = pytest.mark.cpu_test
 
@@ -386,6 +392,315 @@ def test_online_prefill_aligns_to_frame_boundary():
     scheduler.add_request(update)
     output = scheduler.schedule()
     assert output.num_scheduled_tokens == {"online": 540}
+
+
+def test_online_prefill_running_partition_prioritizes_flush_and_decode(tmp_path):
+    model = _make_local_test_model(tmp_path)
+    scheduler = create_scheduler(
+        model=model,
+        enable_online_prefill=True,
+        skip_tokenizer_init=True,
+    )
+
+    (decode_req,) = create_requests(num_requests=1, num_tokens=16, req_ids=["decode"])
+    (append_req,) = create_requests(
+        num_requests=1,
+        num_tokens=16,
+        req_ids=["append"],
+        resumable=True,
+        online_prefill_enabled=True,
+        stream_end=False,
+    )
+    decode_req.status = RequestStatus.RUNNING
+    append_req.status = RequestStatus.RUNNING
+    append_req.online_stream_ended = False
+
+    scheduler.running = [append_req, decode_req]
+    scheduler._partition_running_by_priority_group()
+
+    assert scheduler.running == [decode_req, append_req]
+
+
+def test_online_prefill_early_finalize_keeps_prefilled_frames_and_suffix(tmp_path):
+    model = _make_local_test_model(tmp_path)
+    scheduler = create_scheduler(
+        model=model,
+        enable_online_prefill=True,
+        enable_online_prefill_early_finalizer=True,
+        online_prefill_early_finalize_min_tokens=60,
+        skip_tokenizer_init=True,
+    )
+    scheduler.kv_cache_manager.remove_skipped_blocks = Mock()
+
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=120,
+        req_ids=["online"],
+        resumable=True,
+        online_prefill_enabled=True,
+        frame_token_sizes=[[60, 60]],
+        online_prefill_finalize_token_ids=[[7, 8]],
+    )
+    request.status = RequestStatus.RUNNING
+    request.online_stream_ended = False
+    request.decode_blocked_until_stream_end = True
+    request.num_computed_tokens = 60
+    request.num_prompt_tokens_prefilled = 60
+    request.num_prompt_tokens_received = 120
+    scheduler.requests[request.request_id] = request
+    scheduler.running = [request]
+
+    assert scheduler._should_early_finalize(request)
+    scheduler._early_finalize_request(request, timestamp=0.0)
+
+    assert request.early_finalized is True
+    assert request.online_stream_ended is True
+    assert request.decode_blocked_until_stream_end is True
+    assert request.num_prompt_tokens == 62
+    assert request.num_prompt_tokens_received == 62
+    assert request.num_prompt_tokens_prefilled == 60
+    assert request.num_computed_tokens == 60
+    assert request.online_prefill_finalize_token_ids == [7, 8]
+    scheduler.kv_cache_manager.remove_skipped_blocks.assert_called_once_with(
+        request_id="online", total_computed_tokens=60
+    )
+
+
+def test_online_prefill_waiting_for_input_early_finalizes_under_kv_pressure(tmp_path):
+    model = _make_local_test_model(tmp_path)
+    scheduler = create_scheduler(
+        model=model,
+        enable_online_prefill=True,
+        enable_online_prefill_early_finalizer=True,
+        online_prefill_early_finalize_min_tokens=60,
+        online_prefill_early_finalize_kv_usage_threshold=0.9,
+        skip_tokenizer_init=True,
+    )
+    scheduler.kv_cache_manager.remove_skipped_blocks = Mock()
+    scheduler.kv_cache_manager.block_pool.get_usage = Mock(return_value=0.91)
+
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=90,
+        req_ids=["online"],
+        resumable=True,
+        online_prefill_enabled=True,
+        frame_token_sizes=[[60, 30]],
+        online_prefill_finalize_token_ids=[[7, 8]],
+    )
+    scheduler.add_request(request)
+    request.online_prefill_chunk_size = 60
+    request.online_stream_ended = False
+    request.decode_blocked_until_stream_end = True
+    request.num_computed_tokens = 60
+    request.num_prompt_tokens_prefilled = 60
+    request.num_prompt_tokens_received = 90
+
+    early_finalize_spy = Mock(wraps=scheduler._early_finalize_request)
+    scheduler._early_finalize_request = early_finalize_spy
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {"online": 2}
+    early_finalize_spy.assert_called_once_with(
+        request, ANY, allow_waiting=True
+    )
+    assert request.early_finalized is True
+    assert request.online_stream_ended is True
+    assert request.num_prompt_tokens == 62
+    assert request.num_computed_tokens == 62
+    scheduler.kv_cache_manager.remove_skipped_blocks.assert_called_once_with(
+        request_id="online", total_computed_tokens=60
+    )
+
+
+def test_online_prefill_early_finalize_kv_pressure_threshold(tmp_path):
+    model = _make_local_test_model(tmp_path)
+    scheduler = create_scheduler(
+        model=model,
+        enable_online_prefill=True,
+        enable_online_prefill_early_finalizer=True,
+        online_prefill_early_finalize_kv_usage_threshold=0.9,
+        skip_tokenizer_init=True,
+    )
+
+    scheduler.kv_cache_manager.block_pool.get_usage = Mock(return_value=0.89)
+    assert not scheduler._is_kv_cache_under_pressure()
+
+    scheduler.kv_cache_manager.block_pool.get_usage = Mock(return_value=0.9)
+    assert scheduler._is_kv_cache_under_pressure()
+
+
+def test_online_prefill_waiting_encoder_block_early_finalizes_under_pressure(
+    tmp_path,
+):
+    model = _make_local_test_model(tmp_path)
+    scheduler = create_scheduler(
+        model=model,
+        enable_online_prefill=True,
+        enable_online_prefill_early_finalizer=True,
+        online_prefill_early_finalize_min_tokens=60,
+        online_prefill_early_finalize_kv_usage_threshold=0.9,
+        skip_tokenizer_init=True,
+    )
+    scheduler.kv_cache_manager.block_pool.get_usage = Mock(return_value=0.91)
+    scheduler.kv_cache_manager.remove_skipped_blocks = Mock()
+    scheduler._try_schedule_encoder_inputs = Mock(
+        return_value=([], 0, scheduler.max_num_encoder_input_tokens, [])
+    )
+
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=120,
+        req_ids=["online"],
+        resumable=True,
+        online_prefill_enabled=True,
+        frame_token_sizes=[[60, 60]],
+        online_prefill_finalize_token_ids=[[7, 8]],
+        mm_positions=[
+            [
+                PlaceholderRange(offset=0, length=60),
+                PlaceholderRange(offset=60, length=60),
+            ]
+        ],
+    )
+    scheduler.add_request(request)
+    request.online_prefill_chunk_size = 60
+    request.num_computed_tokens = 60
+    request.num_prompt_tokens_prefilled = 60
+    request.num_prompt_tokens_received = 120
+
+    early_finalize_spy = Mock(wraps=scheduler._early_finalize_request)
+    scheduler._early_finalize_request = early_finalize_spy
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {}
+    early_finalize_spy.assert_called_once_with(
+        request, ANY, allow_waiting=True
+    )
+    assert request.early_finalized is True
+    assert request.online_stream_ended is True
+    scheduler.kv_cache_manager.remove_skipped_blocks.assert_called_once_with(
+        request_id="online", total_computed_tokens=60
+    )
+
+
+def test_online_prefill_running_encoder_block_early_finalizes_under_pressure(
+    tmp_path,
+):
+    model = _make_local_test_model(tmp_path)
+    scheduler = create_scheduler(
+        model=model,
+        enable_online_prefill=True,
+        enable_online_prefill_early_finalizer=True,
+        online_prefill_early_finalize_min_tokens=60,
+        online_prefill_early_finalize_kv_usage_threshold=0.9,
+        skip_tokenizer_init=True,
+    )
+    scheduler.kv_cache_manager.block_pool.get_usage = Mock(return_value=0.91)
+    scheduler.kv_cache_manager.remove_skipped_blocks = Mock()
+    scheduler._try_schedule_encoder_inputs = Mock(
+        return_value=([], 0, scheduler.max_num_encoder_input_tokens, [])
+    )
+
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=120,
+        req_ids=["online"],
+        resumable=True,
+        online_prefill_enabled=True,
+        frame_token_sizes=[[60, 60]],
+        online_prefill_finalize_token_ids=[[7, 8]],
+        mm_positions=[
+            [
+                PlaceholderRange(offset=0, length=60),
+                PlaceholderRange(offset=60, length=60),
+            ]
+        ],
+    )
+    request.status = RequestStatus.RUNNING
+    request.online_prefill_chunk_size = 60
+    request.num_computed_tokens = 60
+    request.num_prompt_tokens_prefilled = 60
+    request.num_prompt_tokens_received = 120
+    scheduler.requests[request.request_id] = request
+    scheduler.running = [request]
+
+    early_finalize_spy = Mock(wraps=scheduler._early_finalize_request)
+    scheduler._early_finalize_request = early_finalize_spy
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {}
+    early_finalize_spy.assert_called_once_with(request, ANY)
+    assert request.early_finalized is True
+    assert request.online_stream_ended is True
+    scheduler.kv_cache_manager.remove_skipped_blocks.assert_called_once_with(
+        request_id="online", total_computed_tokens=60
+    )
+
+
+def test_online_prefill_preemption_routes_to_early_finalize(tmp_path):
+    model = _make_local_test_model(tmp_path)
+    scheduler = create_scheduler(
+        model=model,
+        max_num_batched_tokens=128,
+        num_blocks=9,
+        block_size=16,
+        enable_prefix_caching=False,
+        enable_online_prefill=True,
+        enable_online_prefill_early_finalizer=True,
+        online_prefill_early_finalize_min_tokens=60,
+        skip_tokenizer_init=True,
+    )
+
+    (online_req,) = create_requests(
+        num_requests=1,
+        num_tokens=120,
+        req_ids=["online"],
+        resumable=True,
+        online_prefill_enabled=True,
+        frame_token_sizes=[[60, 60]],
+        online_prefill_finalize_token_ids=[[7, 8]],
+    )
+    (blocker_req,) = create_requests(
+        num_requests=1,
+        num_tokens=120,
+        req_ids=["blocker"],
+        resumable=True,
+        online_prefill_enabled=True,
+        frame_token_sizes=[[60, 60]],
+    )
+    online_req.status = RequestStatus.RUNNING
+    online_req.num_computed_tokens = 60
+    online_req.num_prompt_tokens_prefilled = 60
+    online_req.num_prompt_tokens_received = 120
+    online_req.decode_blocked_until_stream_end = True
+    online_req.online_prefill_chunk_size = 60
+    blocker_req.status = RequestStatus.RUNNING
+    blocker_req.num_computed_tokens = 60
+    blocker_req.num_prompt_tokens_prefilled = 60
+    blocker_req.num_prompt_tokens_received = 120
+    blocker_req.decode_blocked_until_stream_end = True
+    blocker_req.online_prefill_chunk_size = 60
+
+    scheduler.requests[online_req.request_id] = online_req
+    scheduler.requests[blocker_req.request_id] = blocker_req
+    scheduler.running = [online_req, blocker_req]
+
+    early_finalize_spy = Mock(wraps=scheduler._early_finalize_request)
+    preempt_spy = Mock(wraps=scheduler._preempt_request)
+    scheduler._early_finalize_request = early_finalize_spy
+    scheduler._preempt_request = preempt_spy
+
+    output = scheduler.schedule()
+
+    assert online_req.request_id not in output.num_scheduled_tokens
+    assert early_finalize_spy.call_count == 1
+    assert preempt_spy.call_count == 0
+    assert online_req.early_finalized is True
+    assert online_req.online_stream_ended is True
 
 
 def test_async_scheduling_pp_allows_rescheduling_with_output_placeholders():
@@ -2154,11 +2469,13 @@ def create_scheduler_with_priority(
     Returns:
       {class}`Scheduler` instance with priority scheduling
     """
+    model, force_skip_tokenizer_init = resolve_test_model(model)
     model_config = ModelConfig(
         model=model,
         trust_remote_code=True,
         dtype="float16",
         seed=42,
+        skip_tokenizer_init=force_skip_tokenizer_init,
     )
     if max_model_len is None:
         max_model_len = max_num_batched_tokens
@@ -4193,11 +4510,13 @@ def _create_encoder_decoder_scheduler(
     from vllm.v1.core.encoder_cache_manager import EncoderDecoderCacheManager
     from vllm.v1.kv_cache_interface import CrossAttentionSpec
 
+    model, force_skip_tokenizer_init = resolve_test_model("facebook/opt-125m")
     model_config = ModelConfig(
-        model="facebook/opt-125m",
+        model=model,
         trust_remote_code=True,
         dtype="float16",
         seed=42,
+        skip_tokenizer_init=force_skip_tokenizer_init,
     )
     scheduler_config = SchedulerConfig(
         max_num_seqs=max_num_seqs,
