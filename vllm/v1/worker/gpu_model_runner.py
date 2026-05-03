@@ -3,6 +3,7 @@
 
 import functools
 import gc
+import io
 import itertools
 import threading
 import time
@@ -496,6 +497,9 @@ class GPUModelRunner(
 
         # mm_hash ->  encoder_output
         self.encoder_cache: dict[str, torch.Tensor] = {}
+        self.visual_memory_export_cache: dict[str, torch.Tensor] = {}
+        self.visual_memory_export_order: list[str] = []
+        self.visual_memory_export_max_entries = 512
         self.late_interaction_runner = LateInteractionRunner()
 
         self.use_aux_hidden_state_outputs = False
@@ -859,6 +863,8 @@ class GPUModelRunner(
         stale embeddings computed with old weights are not reused.
         """
         self.encoder_cache.clear()
+        self.visual_memory_export_cache.clear()
+        self.visual_memory_export_order.clear()
         self.late_interaction_runner.clear()
 
     @torch.inference_mode()
@@ -2496,6 +2502,7 @@ class GPUModelRunner(
         scheduler_output: "SchedulerOutput",
     ) -> tuple[
         list[str],
+        list[str | None],
         list[tuple[str, MultiModalKwargsItem]],
         list[tuple[str, PlaceholderRange]],
     ]:
@@ -2506,16 +2513,18 @@ class GPUModelRunner(
                 inputs.
 
         Returns:
-            A tuple of (mm_hashes, mm_kwargs, mm_lora_refs) where:
+            A tuple of (mm_hashes, base_mm_hashes, mm_kwargs, mm_lora_refs) where:
             - mm_hashes: List of multimodal hashes for each item
+            - base_mm_hashes: List of multimodal hashes without LoRA prefixes
             - mm_kwargs: List of multimodal kwargs for each item
             - mm_lora_refs: List of (req_id, placeholder_range) for each item
         """
         scheduled_encoder_inputs = scheduler_output.scheduled_encoder_inputs
         if not scheduled_encoder_inputs:
-            return [], [], []
+            return [], [], [], []
 
         mm_hashes = list[str]()
+        base_mm_hashes = list[str | None]()
         mm_kwargs = list[tuple[str, MultiModalKwargsItem]]()
         # Multimodal LoRA reference info to map each multimodal item
         # back to its request & position
@@ -2529,17 +2538,21 @@ class GPUModelRunner(
                     continue
 
                 mm_hashes.append(mm_feature.identifier)
+                base_mm_hashes.append(mm_feature.mm_hash)
                 mm_kwargs.append((mm_feature.modality, mm_feature.data))
                 mm_lora_refs.append((req_id, mm_feature.mm_position))
 
-        return mm_hashes, mm_kwargs, mm_lora_refs
+        return mm_hashes, base_mm_hashes, mm_kwargs, mm_lora_refs
 
     def _execute_mm_encoder(
         self, scheduler_output: "SchedulerOutput"
     ) -> list[torch.Tensor]:
-        mm_hashes, mm_kwargs, mm_lora_refs = self._batch_mm_inputs_from_scheduler(
-            scheduler_output
-        )
+        (
+            mm_hashes,
+            base_mm_hashes,
+            mm_kwargs,
+            mm_lora_refs,
+        ) = self._batch_mm_inputs_from_scheduler(scheduler_output)
 
         if not mm_kwargs:
             return []
@@ -2680,12 +2693,61 @@ class GPUModelRunner(
             current_item_idx += num_items
 
         # Cache the encoder outputs by mm_hash
-        for mm_hash, output in zip(mm_hashes, encoder_outputs):
+        for mm_hash, base_mm_hash, output in zip(
+            mm_hashes, base_mm_hashes, encoder_outputs
+        ):
             self.encoder_cache[mm_hash] = output
+            self._remember_visual_memory_export(mm_hash, output)
+            if base_mm_hash is not None and base_mm_hash != mm_hash:
+                self._remember_visual_memory_export(base_mm_hash, output)
             logger.debug("Finish execute for mm hash %s", mm_hash)
             self.maybe_save_ec_to_connector(self.encoder_cache, mm_hash)
 
         return encoder_outputs
+
+    def _remember_visual_memory_export(
+        self,
+        mm_hash: str,
+        output: torch.Tensor,
+    ) -> None:
+        if output.ndim != 2:
+            return
+        if mm_hash not in self.visual_memory_export_cache:
+            self.visual_memory_export_order.append(mm_hash)
+        self.visual_memory_export_cache[mm_hash] = output.detach().to(
+            device="cpu", copy=True
+        )
+        while (
+            len(self.visual_memory_export_order)
+            > self.visual_memory_export_max_entries
+        ):
+            old_hash = self.visual_memory_export_order.pop(0)
+            self.visual_memory_export_cache.pop(old_hash, None)
+
+    def export_visual_memory_cache(
+        self,
+        mm_hashes: list[str],
+    ) -> list[bytes | None]:
+        outputs: list[bytes | None] = []
+        for mm_hash in mm_hashes:
+            output = self.visual_memory_export_cache.get(mm_hash)
+            if output is None:
+                live_output = self.encoder_cache.get(mm_hash)
+                output = (
+                    None
+                    if live_output is None
+                    else live_output.detach().to(device="cpu", copy=True)
+                )
+            outputs.append(
+                None if output is None else self._serialize_visual_memory_export(output)
+            )
+        return outputs
+
+    @staticmethod
+    def _serialize_visual_memory_export(output: torch.Tensor) -> bytes:
+        payload = io.BytesIO()
+        torch.save(output.contiguous(), payload)
+        return payload.getvalue()
 
     def _gather_mm_embeddings(
         self,

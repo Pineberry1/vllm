@@ -152,7 +152,6 @@ _VISUAL_TOKEN_MERGER_KWARGS = {
     "visual_token_merger_block_hw",
 }
 
-
 def _strip_visual_token_merger_kwargs(
     mm_kwargs: Mapping[str, object],
 ) -> dict[str, object]:
@@ -1017,6 +1016,64 @@ class Qwen3VLDummyInputsBuilder(BaseDummyInputsBuilder[Qwen3VLProcessingInfo]):
 
 
 class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo]):
+    @staticmethod
+    def _apply_image_merger_placeholder_counts(
+        *,
+        input_ids: torch.Tensor,
+        image_grid_thw: torch.Tensor,
+        image_token_id: int,
+        merge_size: int,
+        alpha: float,
+    ) -> torch.Tensor:
+        if input_ids.ndim != 2 or input_ids.shape[0] != 1:
+            raise ValueError(
+                "Qwen3-VL image placeholder rewriting expects a single prompt"
+            )
+
+        token_ids = input_ids[0].tolist()
+        out_token_ids: list[int] = []
+        cursor = 0
+        for grid_thw in image_grid_thw.tolist():
+            num_frames = int(grid_thw[0])
+            full_tokens = int(grid_thw[0] * grid_thw[1] * grid_thw[2]) // (
+                merge_size**2
+            )
+            folded_tokens = _estimate_visual_token_merger_count(
+                full_tokens, num_frames, alpha
+            )
+
+            try:
+                image_start = token_ids.index(image_token_id, cursor)
+            except ValueError as exc:
+                raise ValueError(
+                    "Could not locate Qwen3-VL image placeholder tokens for "
+                    "visual_token_merger_alpha"
+                ) from exc
+
+            image_end = image_start
+            while (
+                image_end < len(token_ids)
+                and token_ids[image_end] == image_token_id
+            ):
+                image_end += 1
+
+            expected_end = image_start + full_tokens
+            if (
+                expected_end <= len(token_ids)
+                and token_ids[image_start:expected_end]
+                == [image_token_id] * full_tokens
+            ):
+                image_end = expected_end
+
+            out_token_ids.extend(token_ids[cursor:image_start])
+            out_token_ids.extend([image_token_id] * folded_tokens)
+            cursor = image_end
+
+        out_token_ids.extend(token_ids[cursor:])
+        return torch.tensor(
+            [out_token_ids], device=input_ids.device, dtype=input_ids.dtype
+        )
+
     def _call_hf_processor(
         self,
         prompt: str,
@@ -1184,6 +1241,38 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
             mm_kwargs=processor_mm_kwargs,
             tok_kwargs=tok_kwargs,
         )
+        image_grid_thw = processed_outputs.get("image_grid_thw")
+        if merger_alpha is not None and image_grid_thw is not None:
+            assert isinstance(image_grid_thw, torch.Tensor)
+            num_images = int(image_grid_thw.shape[0])
+            if num_images:
+                input_ids = processed_outputs["input_ids"]
+                assert isinstance(input_ids, torch.Tensor)
+                processed_outputs["input_ids"] = (
+                    self._apply_image_merger_placeholder_counts(
+                        input_ids=input_ids,
+                        image_grid_thw=image_grid_thw,
+                        image_token_id=self.info.get_hf_config().image_token_id,
+                        merge_size=processor.image_processor.merge_size,
+                        alpha=merger_alpha,
+                    )
+                )
+                attention_mask = processed_outputs.get("attention_mask")
+                if isinstance(attention_mask, torch.Tensor):
+                    processed_outputs["attention_mask"] = torch.ones_like(
+                        processed_outputs["input_ids"]
+                    )
+                processed_outputs.update(
+                    image_visual_token_merger_alpha=torch.full(
+                        (num_images,), merger_alpha, dtype=torch.float32
+                    ),
+                    image_visual_token_merger_block_t=torch.full(
+                        (num_images,), merger_block_t, dtype=torch.long
+                    ),
+                    image_visual_token_merger_block_hw=torch.full(
+                        (num_images,), merger_block_hw, dtype=torch.long
+                    ),
+                )
         combined_outputs = dict(
             processed_outputs,
             **video_outputs,
@@ -1210,6 +1299,18 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
                 ),
                 visual_token_merger_block_hw=MultiModalFieldConfig.batched(
                     "video", keep_on_cpu=True
+                ),
+            )
+        if "image_visual_token_merger_alpha" in hf_inputs:
+            field_config.update(
+                image_visual_token_merger_alpha=MultiModalFieldConfig.batched(
+                    "image", keep_on_cpu=True
+                ),
+                image_visual_token_merger_block_t=MultiModalFieldConfig.batched(
+                    "image", keep_on_cpu=True
+                ),
+                image_visual_token_merger_block_hw=MultiModalFieldConfig.batched(
+                    "image", keep_on_cpu=True
                 ),
             )
         return field_config
@@ -1239,6 +1340,15 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
             assert isinstance(grid_thw, torch.Tensor)
 
             num_tokens = int(grid_thw.prod()) // merge_length
+            merger_alpha = _get_visual_token_merger_alpha(
+                mm_config, hf_processor_mm_kwargs
+            )
+            if merger_alpha is not None:
+                num_tokens = _estimate_visual_token_merger_count(
+                    num_tokens,
+                    int(grid_thw[0]),
+                    merger_alpha,
+                )
             return [hf_processor.image_token_id] * num_tokens
 
         def get_video_replacement_qwen3vl(item_idx: int):
@@ -1657,6 +1767,64 @@ class Qwen3VLForConditionalGeneration(
             return value[item_idx]
         return value
 
+    def _get_image_input_item_value(
+        self,
+        image_input: Qwen2_5_VLImageInputs,
+        field_name: str,
+        item_idx: int,
+        default: object | None = None,
+    ) -> object | None:
+        value = image_input.get(field_name, None)
+        if value is None:
+            return default
+        if isinstance(value, torch.Tensor):
+            if value.ndim == 0:
+                return value.item()
+            return value[item_idx].item()
+        if isinstance(value, (list, tuple)):
+            return value[item_idx]
+        return value
+
+    def _get_visual_token_merger_params_for_image(
+        self,
+        image_input: Qwen2_5_VLImageInputs,
+        image_idx: int,
+    ) -> tuple[float, int, int] | None:
+        alpha = self._get_image_input_item_value(
+            image_input,
+            "image_visual_token_merger_alpha",
+            image_idx,
+            self.visual_token_merger_alpha,
+        )
+        if alpha is None:
+            return None
+        alpha = float(alpha)
+        if not 0.0 < alpha < 1.0:
+            return None
+        if self.is_multimodal_pruning_enabled:
+            raise ValueError(
+                "video_pruning_rate and visual_token_merger_alpha are mutually "
+                "exclusive. Configure only one visual token reduction method."
+            )
+
+        block_t = int(
+            self._get_image_input_item_value(
+                image_input,
+                "image_visual_token_merger_block_t",
+                image_idx,
+                self.visual_token_merger_block_t,
+            )
+        )
+        block_hw = int(
+            self._get_image_input_item_value(
+                image_input,
+                "image_visual_token_merger_block_hw",
+                image_idx,
+                self.visual_token_merger_block_hw,
+            )
+        )
+        return alpha, block_t, block_hw
+
     def _get_visual_token_merger_params_for_video(
         self,
         video_input: Qwen2_5_VLVideoInputs,
@@ -1711,12 +1879,35 @@ class Qwen3VLForConditionalGeneration(
             for video_idx in range(num_videos)
         )
 
+    def _is_visual_token_merger_image_input_enabled(
+        self,
+        image_input: Qwen2_5_VLImageInputs | None,
+    ) -> bool:
+        if image_input is None:
+            return False
+        grid_thw = image_input["image_grid_thw"]
+        num_images = int(grid_thw.shape[0])
+        return any(
+            self._get_visual_token_merger_params_for_image(image_input, image_idx)
+            is not None
+            for image_idx in range(num_images)
+        )
+
     def _parse_and_validate_image_input(
         self, **kwargs: object
     ) -> Qwen2_5_VLImageInputs | None:
         pixel_values = kwargs.pop("pixel_values", None)
         image_embeds = kwargs.pop("image_embeds", None)
         image_grid_thw = kwargs.pop("image_grid_thw", None)
+        image_visual_token_merger_alpha = kwargs.pop(
+            "image_visual_token_merger_alpha", None
+        )
+        image_visual_token_merger_block_t = kwargs.pop(
+            "image_visual_token_merger_block_t", None
+        )
+        image_visual_token_merger_block_hw = kwargs.pop(
+            "image_visual_token_merger_block_hw", None
+        )
 
         if pixel_values is None and image_embeds is None:
             return None
@@ -1726,6 +1917,9 @@ class Qwen3VLForConditionalGeneration(
                 type="pixel_values",
                 pixel_values=pixel_values,
                 image_grid_thw=image_grid_thw,
+                image_visual_token_merger_alpha=image_visual_token_merger_alpha,
+                image_visual_token_merger_block_t=image_visual_token_merger_block_t,
+                image_visual_token_merger_block_hw=image_visual_token_merger_block_hw,
             )
 
         if image_embeds is not None:
@@ -1733,6 +1927,9 @@ class Qwen3VLForConditionalGeneration(
                 type="image_embeds",
                 image_embeds=image_embeds,
                 image_grid_thw=image_grid_thw,
+                image_visual_token_merger_alpha=image_visual_token_merger_alpha,
+                image_visual_token_merger_block_t=image_visual_token_merger_block_t,
+                image_visual_token_merger_block_hw=image_visual_token_merger_block_hw,
             )
 
     def _parse_and_validate_video_input(
@@ -1845,13 +2042,32 @@ class Qwen3VLForConditionalGeneration(
         """
         if append_positions is None:
             append_positions = self.is_multimodal_pruning_enabled
-        if append_positions:
-            merge_size = self.visual.spatial_merge_size
-            grid_thw = image_input["image_grid_thw"]
-            grid_thw_list = grid_thw.tolist()
-            image_embeds_out = []
-            for emb, size in zip(image_embeds_split, grid_thw_list):
+        merge_size = self.visual.spatial_merge_size
+        grid_thw = image_input["image_grid_thw"]
+        grid_thw_list = grid_thw.tolist()
+        image_embeds_out = []
+        for image_idx, (emb, size) in enumerate(zip(image_embeds_split, grid_thw_list)):
+            merger_params = self._get_visual_token_merger_params_for_image(
+                image_input, image_idx
+            )
+            position_mask = None
+            if merger_params is not None:
+                alpha, block_t, block_hw = merger_params
+                emb = emb.contiguous()
+                emb, _, token_state, _source_count, _alpha_init = compute_tri_state_folding(
+                    emb,
+                    size,
+                    spatial_merge_size=merge_size,
+                    alpha=alpha,
+                    block_t=block_t,
+                    block_hw=block_hw,
+                )
+                position_mask = token_state != 2
+
+            if append_positions or merger_params is not None:
                 positions = compute_mrope_for_media(size, merge_size).to(emb.device)
+                if position_mask is not None:
+                    positions = positions[position_mask]
                 positions = torch.cat(
                     [
                         positions,
@@ -1862,9 +2078,8 @@ class Qwen3VLForConditionalGeneration(
                     dim=1,
                 )
                 emb = torch.cat([emb, positions], dim=1)
-                image_embeds_out.append(emb)
-            image_embeds_split = tuple(image_embeds_out)
-        return image_embeds_split
+            image_embeds_out.append(emb)
+        return tuple(image_embeds_out)
 
     def _postprocess_video_embeds_evs(
         self,
@@ -1926,7 +2141,7 @@ class Qwen3VLForConditionalGeneration(
             elif merger_params is not None:
                 alpha, block_t, block_hw = merger_params
                 emb = emb.contiguous()
-                emb, num_tokens_per_frame, token_state, _ = compute_tri_state_folding(
+                emb, num_tokens_per_frame, token_state, _source_count, _alpha_init = compute_tri_state_folding(
                     emb,
                     size,
                     spatial_merge_size=self.visual.spatial_merge_size,
@@ -2133,6 +2348,7 @@ class Qwen3VLForConditionalGeneration(
     def _iter_mm_grid_hw(
         input_tokens: list[int],
         mm_features: list[MultiModalFeatureSpec],
+        image_token_id: int,
         video_token_id: int,
         vision_start_token_id: int,
         vision_end_token_id: int,
@@ -2144,6 +2360,7 @@ class Qwen3VLForConditionalGeneration(
             input_tokens: List of token IDs in the input sequence.
             mm_features: List of multimodal feature specifications containing
                 image/video data and position information.
+            image_token_id: Token ID used for image tokens.
             video_token_id: Token ID used for video tokens.
             vision_start_token_id: Token ID marking the start of a vision sequence.
             vision_end_token_id: Token ID marking the end of a vision sequence.
@@ -2163,7 +2380,10 @@ class Qwen3VLForConditionalGeneration(
                 assert t == 1, f"Image must have 1 frame, got {t}"
                 llm_grid_h = h // spatial_merge_size
                 llm_grid_w = w // spatial_merge_size
-                yield offset, llm_grid_h, llm_grid_w, llm_grid_h * llm_grid_w
+                # Image placeholders can be adjacent, so counting contiguous
+                # image_token_id values from offset would swallow following frames.
+                actual_num_tokens = int(mm_feature.mm_position.length)
+                yield offset, llm_grid_h, llm_grid_w, actual_num_tokens
             elif mm_feature.modality == "video":
                 t, h, w = mm_feature.data["video_grid_thw"].data.tolist()
                 llm_grid_h = h // spatial_merge_size
@@ -2220,6 +2440,22 @@ class Qwen3VLForConditionalGeneration(
         mm_features: list[MultiModalFeatureSpec],
         config: Qwen3VLConfig,
     ):
+        # Multi-modal features may be grouped by modality instead of prompt
+        # order (e.g. a visual-memory video prefix followed by image frames).
+        # mRoPE text spans must be generated in token order.
+        mm_spans = sorted(
+            Qwen3VLForConditionalGeneration._iter_mm_grid_hw(
+                input_tokens,
+                mm_features,
+                image_token_id=config.image_token_id,
+                video_token_id=config.video_token_id,
+                vision_start_token_id=config.vision_start_token_id,
+                vision_end_token_id=config.vision_end_token_id,
+                spatial_merge_size=config.vision_config.spatial_merge_size,
+            ),
+            key=lambda item: item[0],
+        )
+
         llm_pos_ids_list = []
         st = 0
         for (
@@ -2227,14 +2463,7 @@ class Qwen3VLForConditionalGeneration(
             llm_grid_h,
             llm_grid_w,
             actual_num_tokens,
-        ) in Qwen3VLForConditionalGeneration._iter_mm_grid_hw(
-            input_tokens,
-            mm_features,
-            video_token_id=config.video_token_id,
-            vision_start_token_id=config.vision_start_token_id,
-            vision_end_token_id=config.vision_end_token_id,
-            spatial_merge_size=config.vision_config.spatial_merge_size,
-        ):
+        ) in mm_spans:
             # Skip frames with 0 tokens (EVS placeholder with tokens lumped elsewhere)
             if actual_num_tokens == 0:
                 continue
@@ -2272,9 +2501,11 @@ class Qwen3VLForConditionalGeneration(
                     grid_indices = full_grid[:, :remainder]
                     llm_pos_ids_list.append(grid_indices + text_len + st_idx)
             else:
-                # Normal case: frame has exactly the expected tokens (after actual EVS
-                # pruning).
+                # Normal or locally folded case: take the raster prefix matching
+                # the actual placeholder length. If no reduction happened, this
+                # is the full frame grid.
                 grid_indices = np.indices((1, llm_grid_h, llm_grid_w)).reshape(3, -1)
+                grid_indices = grid_indices[:, :actual_num_tokens]
                 llm_pos_ids_list.append(grid_indices + text_len + st_idx)
 
             st = offset + actual_num_tokens
@@ -2391,6 +2622,10 @@ class Qwen3VLForConditionalGeneration(
             return None
 
         video_input = mm_input_by_modality.get("video")
+        image_input = mm_input_by_modality.get("image")
+        has_image_token_reduction = self._is_visual_token_merger_image_input_enabled(
+            image_input
+        )
         has_video_token_reduction = (
             self.is_multimodal_pruning_enabled
             or self._is_visual_token_merger_input_enabled(video_input)
@@ -2409,7 +2644,9 @@ class Qwen3VLForConditionalGeneration(
                 image_embeddings = self._postprocess_image_embeds_evs(
                     image_embeddings,
                     multimodal_input,
-                    append_positions=has_video_token_reduction,
+                    append_positions=(
+                        has_video_token_reduction or has_image_token_reduction
+                    ),
                 )
                 multimodal_embeddings.extend(image_embeddings)
             if modality == "video":

@@ -716,6 +716,12 @@ class Worker(WorkerBase):
     def reset_encoder_cache(self) -> None:
         self.model_runner.reset_encoder_cache()
 
+    def export_visual_memory_cache(
+        self,
+        mm_hashes: list[str],
+    ) -> list[bytes | None]:
+        return self.model_runner.export_visual_memory_cache(mm_hashes)
+
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()
 

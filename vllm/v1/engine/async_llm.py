@@ -920,6 +920,14 @@ class AsyncLLM(EngineClient):
     async def reset_encoder_cache(self) -> None:
         await self.engine_core.reset_encoder_cache_async()
 
+    async def export_visual_memory_cache(
+        self,
+        mm_hashes: list[str],
+    ) -> list[Any]:
+        return await self.engine_core.collective_rpc_async(
+            "export_visual_memory_cache", args=(mm_hashes,)
+        )
+
     async def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
         await self.engine_core.sleep_async(level, mode)
 

@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
+from pathlib import Path
+
 import torch
 
 from tests.v1.kv_connector.unit.utils import MockKVConfig
@@ -33,10 +36,34 @@ from vllm.v1.request import Request
 from vllm.v1.structured_output import StructuredOutputManager
 
 EOS_TOKEN_ID = 50256
+_DEFAULT_TEST_MODEL_DIR = Path("/tmp/vllm_scheduler_test_model")
 
 
 def mock_kv(matched_tokens: int, is_async: bool):
     return MockKVConfig(matched_tokens=matched_tokens, is_async=is_async)
+
+
+def _ensure_default_test_model() -> str:
+    config_path = _DEFAULT_TEST_MODEL_DIR / "config.json"
+    if not config_path.exists():
+        _DEFAULT_TEST_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(
+            json.dumps(
+                {
+                    "architectures": ["GPT2LMHeadModel"],
+                    "model_type": "gpt2",
+                    "vocab_size": 128,
+                    "n_positions": 1024,
+                    "n_ctx": 1024,
+                    "n_embd": 32,
+                    "n_layer": 2,
+                    "n_head": 2,
+                    "bos_token_id": 0,
+                    "eos_token_id": 1,
+                }
+            )
+        )
+    return str(_DEFAULT_TEST_MODEL_DIR)
 
 
 def create_scheduler(
@@ -72,6 +99,10 @@ def create_scheduler(
     Returns:
       {class}`Scheduler` instance
     """
+    if model == "facebook/opt-125m":
+        model = _ensure_default_test_model()
+        skip_tokenizer_init = True
+
     model_config = ModelConfig(
         model=model,
         trust_remote_code=True,

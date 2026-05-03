@@ -269,6 +269,37 @@ def test_online_prefill_decode_starts_after_stream_end():
     assert request.deferred_output_token_ids == []
 
 
+def test_online_prefill_stream_end_flush_runs_before_ongoing_chunk():
+    scheduler = create_scheduler(
+        enable_online_prefill=True,
+        max_num_batched_tokens=768,
+        max_model_len=2048,
+    )
+
+    (ongoing,) = create_requests(
+        num_requests=1,
+        num_tokens=512,
+        req_ids=["ongoing"],
+        resumable=True,
+        online_prefill_enabled=True,
+    )
+    (ended,) = create_requests(
+        num_requests=1,
+        num_tokens=256,
+        req_ids=["ended"],
+        resumable=True,
+        online_prefill_enabled=True,
+        stream_end=True,
+    )
+
+    scheduler.add_request(ongoing)
+    scheduler.add_request(ended)
+
+    output = scheduler.schedule()
+    assert list(output.num_scheduled_tokens) == ["ended", "ongoing"]
+    assert output.num_scheduled_tokens == {"ended": 256, "ongoing": 512}
+
+
 def test_online_prefill_tail_flush_happens_only_after_stream_end():
     scheduler = create_scheduler(enable_online_prefill=True)
     (request,) = create_requests(
@@ -302,7 +333,9 @@ def test_online_prefill_tail_flush_happens_only_after_stream_end():
     assert request.deferred_output_token_ids == [21]
 
     output = scheduler.schedule()
-    assert output.num_scheduled_tokens == {"online": 1}
+    # Resume through the one-token decode placeholder after recomputing the
+    # final prompt token.
+    assert output.num_scheduled_tokens == {"online": 2}
     engine_outputs = scheduler.update_from_output(
         output, _make_model_runner_output(request, [22])
     )

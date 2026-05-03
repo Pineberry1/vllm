@@ -144,6 +144,14 @@ class EngineClient(ABC):
         ...
 
     @abstractmethod
+    async def export_visual_memory_cache(
+        self,
+        mm_hashes: list[str],
+    ) -> list[Any]:
+        """Export cached multimodal encoder outputs by mm hash."""
+        ...
+
+    @abstractmethod
     async def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
