@@ -460,6 +460,8 @@ class Scheduler(SchedulerInterface):
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
                     self._early_finalize_request(request, scheduled_timestamp)
+                    self._requeue_early_finalized_decode(request)
+                    continue
                 # The request cannot be scheduled because one of the following
                 # reasons:
                 # 1. No new tokens to schedule. This may happen when
@@ -519,14 +521,16 @@ class Scheduler(SchedulerInterface):
                         if not early_finalize:
                             self.running.remove(preempted_req)
                             req_index -= 1
-                    elif early_finalize and preempted_req in self.running:
-                        self.running.remove(preempted_req)
-
                     if early_finalize:
                         self._early_finalize_request(
                             preempted_req,
                             scheduled_timestamp,
                         )
+                        removed_index = self._requeue_early_finalized_decode(
+                            preempted_req
+                        )
+                        if removed_index is not None and removed_index < req_index:
+                            req_index -= 1
                     else:
                         if preempted_req in self.running:
                             self.running.remove(preempted_req)
@@ -657,13 +661,9 @@ class Scheduler(SchedulerInterface):
                             scheduled_timestamp,
                             allow_waiting=True,
                         )
-                        self._leave_waiting_for_streaming_input(request)
-                        if request.decode_blocked_until_stream_end:
-                            request.status = RequestStatus.WAITING
-                        else:
-                            request.status = RequestStatus.PREEMPTED
-                        self._remove_request_from_waiting_queues(request)
-                        step_skipped_waiting.prepend_request(request)
+                        self._requeue_early_finalized_decode(
+                            request, step_skipped_waiting
+                        )
                         continue
                     self._remove_request_from_waiting_queues(request)
                     step_skipped_waiting.prepend_request(request)
@@ -692,8 +692,9 @@ class Scheduler(SchedulerInterface):
                         self._early_finalize_request(
                             request, scheduled_timestamp, allow_waiting=True
                         )
-                        self._remove_request_from_waiting_queues(request)
-                        step_skipped_waiting.prepend_request(request)
+                        self._requeue_early_finalized_decode(
+                            request, step_skipped_waiting
+                        )
                         continue
                     self._remove_request_from_waiting_queues(request)
                     self._enter_waiting_for_streaming_input(request)
@@ -848,8 +849,9 @@ class Scheduler(SchedulerInterface):
                                     scheduled_timestamp,
                                     allow_waiting=True,
                                 )
-                                self._remove_request_from_waiting_queues(request)
-                                step_skipped_waiting.prepend_request(request)
+                                self._requeue_early_finalized_decode(
+                                    request, step_skipped_waiting
+                                )
                                 continue
                             if request.online_stream_ended:
                                 logger.warning(
@@ -920,8 +922,9 @@ class Scheduler(SchedulerInterface):
                         self._early_finalize_request(
                             request, scheduled_timestamp, allow_waiting=True
                         )
-                        self._remove_request_from_waiting_queues(request)
-                        step_skipped_waiting.prepend_request(request)
+                        self._requeue_early_finalized_decode(
+                            request, step_skipped_waiting
+                        )
                         continue
                     if request.online_stream_ended:
                         logger.warning(
@@ -1209,13 +1212,7 @@ class Scheduler(SchedulerInterface):
                 timestamp,
                 allow_waiting=True,
             )
-            self._leave_waiting_for_streaming_input(request)
-            if request.decode_blocked_until_stream_end:
-                request.status = RequestStatus.WAITING
-            else:
-                request.status = RequestStatus.PREEMPTED
-            self._remove_request_from_waiting_queues(request)
-            self.skipped_waiting.prepend_request(request)
+            self._requeue_early_finalized_decode(request)
 
     def _log_online_prefill_early_finalize_probe(self, timestamp: float) -> None:
         if (
@@ -1355,6 +1352,23 @@ class Scheduler(SchedulerInterface):
             request.num_prompt_tokens_prefilled,
             len(request.online_prefill_finalize_token_ids or ()),
         )
+
+    def _requeue_early_finalized_decode(
+        self,
+        request: Request,
+        queue=None,
+    ) -> int | None:
+        removed_index = None
+        if request in self.running:
+            removed_index = self.running.index(request)
+            self.running.pop(removed_index)
+        self._leave_waiting_for_streaming_input(request)
+        self._remove_request_from_waiting_queues(request)
+        request.status = RequestStatus.WAITING
+        self.prev_step_scheduled_req_ids.discard(request.request_id)
+        target_queue = queue if queue is not None else self.skipped_waiting
+        target_queue.prepend_request(request)
+        return removed_index
 
     def _can_preempt_request(
         self,
