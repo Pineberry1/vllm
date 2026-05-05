@@ -51,9 +51,29 @@ class AsyncScheduler(Scheduler):
             request, new_token_ids
         )
 
-        # Update the number of output placeholders.
-        request.num_output_placeholders -= len(new_token_ids)
-        assert request.num_output_placeholders >= 0
+        # Update the number of output placeholders. Online-prefill can re-enter
+        # decode after a forced stream flush / early-finalize transition; if an
+        # older async placeholder was cleared during that transition, do not let
+        # the accounting mismatch kill the engine.
+        if request.num_output_placeholders < len(new_token_ids):
+            if request.is_online_prefill_request:
+                logger.warning(
+                    "online_prefill async_placeholder_underflow "
+                    "request_id=%s placeholders=%s new_tokens=%s status=%s "
+                    "early_finalized=%s decode_blocked=%s",
+                    request.request_id,
+                    request.num_output_placeholders,
+                    len(new_token_ids),
+                    request.status.name,
+                    request.early_finalized,
+                    request.decode_blocked_until_stream_end,
+                )
+                request.num_output_placeholders = 0
+            else:
+                request.num_output_placeholders -= len(new_token_ids)
+                assert request.num_output_placeholders >= 0
+        else:
+            request.num_output_placeholders -= len(new_token_ids)
 
         # Cache the new tokens. Preempted requests should be skipped.
         if status_before_update == RequestStatus.RUNNING:

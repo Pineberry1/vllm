@@ -372,10 +372,14 @@ class Request:
 
         self.early_finalized = True
         self.mark_stream_end()
+        # The finalized stream is re-entering the normal decode path. Clear any
+        # async decode bookkeeping left from speculative/deferred online-prefill
+        # steps and let the async scheduler create fresh placeholders when the
+        # decode step is actually scheduled.
+        self.num_output_placeholders = 0
         if self.get_unprefilled_prompt_len() == 0:
             self.decode_blocked_until_stream_end = False
             self.pending_stream_flush = False
-            self.num_output_placeholders = max(self.num_output_placeholders, 1)
         else:
             self.decode_blocked_until_stream_end = True
             self.pending_stream_flush = True

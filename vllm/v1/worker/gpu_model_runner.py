@@ -2687,6 +2687,40 @@ class GPUModelRunner(
 
         return encoder_outputs
 
+    def _recover_missing_mm_encoder_output(
+        self,
+        req_id: str,
+        mm_input_id: int,
+        mm_hash: str,
+    ) -> torch.Tensor | None:
+        """Recompute a missing online-prefill encoder output in-place.
+
+        The scheduler and worker normally keep the encoder cache in lockstep.
+        Under online-prefill preemption/requeue pressure, a scheduler step can
+        still reference an encoder item that the worker has already evicted.
+        Recompute it from the retained raw feature data instead of treating the
+        cache miss as an engine-fatal invariant violation.
+        """
+        req_state = self.requests.get(req_id)
+        if req_state is None or mm_input_id >= len(req_state.mm_features):
+            return None
+        if req_state.mm_features[mm_input_id].data is None:
+            return None
+
+        class _SingleEncoderInput:
+            def __init__(self, request_id: str, input_id: int) -> None:
+                self.scheduled_encoder_inputs = {request_id: [input_id]}
+
+        logger.warning(
+            "online_prefill recovering missing encoder cache "
+            "request_id=%s mm_hash=%s input_id=%s",
+            req_id,
+            mm_hash,
+            mm_input_id,
+        )
+        self._execute_mm_encoder(_SingleEncoderInput(req_id, mm_input_id))
+        return self.encoder_cache.get(mm_hash, None)
+
     def _gather_mm_embeddings(
         self,
         scheduler_output: "SchedulerOutput",
@@ -2714,7 +2748,7 @@ class GPUModelRunner(
             req_state = self.requests[req_id]
             num_computed_tokens = req_state.num_computed_tokens + shift_computed_tokens
 
-            for mm_feature in req_state.mm_features:
+            for mm_input_id, mm_feature in enumerate(req_state.mm_features):
                 pos_info = mm_feature.mm_position
                 start_pos = pos_info.offset
                 num_encoder_tokens = pos_info.length
@@ -2747,6 +2781,10 @@ class GPUModelRunner(
 
                 mm_hash = mm_feature.identifier
                 encoder_output = self.encoder_cache.get(mm_hash, None)
+                if encoder_output is None:
+                    encoder_output = self._recover_missing_mm_encoder_output(
+                        req_id, mm_input_id, mm_hash
+                    )
                 assert encoder_output is not None, f"Encoder cache miss for {mm_hash}."
 
                 if (is_embed := pos_info.is_embed) is not None:
