@@ -11,6 +11,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
+
 from fastapi import APIRouter, FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 from PIL import Image
@@ -27,6 +29,7 @@ logger = init_logger(__name__)
 router = APIRouter()
 
 QWEN_VL_IMAGE_PLACEHOLDER = "<|vision_start|><|image_pad|><|vision_end|>"
+QWEN_VL_VIDEO_PLACEHOLDER = "<|vision_start|><|video_pad|><|vision_end|>"
 DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
 _STREAM_DONE = object()
 
@@ -61,11 +64,17 @@ class OnlinePrefillCreateRequest(BaseModel):
     max_tokens: int = 256
     temperature: float = 0.0
     top_p: float = 1.0
+    visual_token_merger_alpha: float | None = None
+    visual_token_merger_block_t: int | None = None
+    visual_token_merger_block_hw: int | None = None
 
 
 class OnlinePrefillAppendRequest(BaseModel):
     frames: list[OnlinePrefillFrame] = Field(default_factory=list)
     stream_end: bool = False
+    visual_token_merger_alpha: float | None = None
+    visual_token_merger_block_t: int | None = None
+    visual_token_merger_block_hw: int | None = None
 
 
 class OnlinePrefillSessionResponse(BaseModel):
@@ -106,12 +115,14 @@ class _OnlinePrefillSession:
     error: str | None = None
     prompt_token_counts: list[int] = field(default_factory=list)
     input_started: bool = False
+    mm_processor_kwargs: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class _QueuedAppend:
     frames: list[OnlinePrefillFrame] = field(default_factory=list)
     stream_end: bool = False
+    mm_processor_kwargs: dict[str, Any] = field(default_factory=dict)
 
 
 class OnlinePrefillSessionManager:
@@ -156,6 +167,7 @@ class OnlinePrefillSessionManager:
                 generation_task=asyncio.create_task(asyncio.sleep(0)),
                 prefix_text=prefix_text,
                 suffix_text=suffix_text,
+                mm_processor_kwargs=self._mm_kwargs_from_request(request),
             )
             session.generation_task = asyncio.create_task(self._run_session(session))
             self._sessions[request.request_id] = session
@@ -181,6 +193,10 @@ class OnlinePrefillSessionManager:
                 _QueuedAppend(
                     frames=list(append_request.frames),
                     stream_end=append_request.stream_end,
+                    mm_processor_kwargs=self._merge_mm_kwargs(
+                        session.mm_processor_kwargs,
+                        self._mm_kwargs_from_request(append_request),
+                    ),
                 )
             )
 
@@ -229,6 +245,7 @@ class OnlinePrefillSessionManager:
                 assert isinstance(item, _QueuedAppend)
                 queued_frames = list(item.frames)
                 stream_end = item.stream_end
+                mm_processor_kwargs = dict(item.mm_processor_kwargs)
 
                 # Drain anything already queued synchronously first.
                 drained_terminal: Any = None
@@ -248,6 +265,11 @@ class OnlinePrefillSessionManager:
                     assert isinstance(next_item, _QueuedAppend)
                     queued_frames.extend(next_item.frames)
                     stream_end = stream_end or next_item.stream_end
+                    if next_item.mm_processor_kwargs:
+                        mm_processor_kwargs = self._merge_mm_kwargs(
+                            mm_processor_kwargs,
+                            next_item.mm_processor_kwargs,
+                        )
 
                 # Merge window: wait briefly for sequential client POSTs to
                 # arrive so their frames coalesce into one StreamingInput.
@@ -277,6 +299,11 @@ class OnlinePrefillSessionManager:
                     assert isinstance(next_item, _QueuedAppend)
                     queued_frames.extend(next_item.frames)
                     stream_end = stream_end or next_item.stream_end
+                    if next_item.mm_processor_kwargs:
+                        mm_processor_kwargs = self._merge_mm_kwargs(
+                            mm_processor_kwargs,
+                            next_item.mm_processor_kwargs,
+                        )
 
                 prefix_text = session.prefix_text if not session.input_started else ""
                 suffix_text = session.suffix_text if stream_end else ""
@@ -290,6 +317,7 @@ class OnlinePrefillSessionManager:
                         suffix_text=suffix_text,
                         stream_end=stream_end,
                         finalize_suffix_text=finalize_suffix_text,
+                        mm_processor_kwargs=mm_processor_kwargs,
                     )
                     session.prompt_token_counts.append(prompt_token_count)
                     session.input_started = True
@@ -380,6 +408,69 @@ class OnlinePrefillSessionManager:
     def _preprocess_text_prompt(self, prompt: str) -> ProcessorInputs:
         return self.input_preprocessor.preprocess({"prompt": prompt})
 
+    @staticmethod
+    def _mm_kwargs_from_request(request: Any) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {}
+        alpha = getattr(request, "visual_token_merger_alpha", None)
+        if alpha is None:
+            raw_alpha = os.environ.get("VLLM_ONLINE_PREFILL_VISUAL_TOKEN_MERGER_ALPHA")
+            if raw_alpha not in (None, ""):
+                try:
+                    alpha = float(raw_alpha)
+                except ValueError:
+                    alpha = None
+        if alpha is not None:
+            kwargs["visual_token_merger_alpha"] = float(alpha)
+
+        block_t = getattr(request, "visual_token_merger_block_t", None)
+        if block_t is None:
+            raw_block_t = os.environ.get(
+                "VLLM_ONLINE_PREFILL_VISUAL_TOKEN_MERGER_BLOCK_T"
+            )
+            if raw_block_t not in (None, ""):
+                try:
+                    block_t = int(raw_block_t)
+                except ValueError:
+                    block_t = None
+        if block_t is not None:
+            kwargs["visual_token_merger_block_t"] = int(block_t)
+
+        block_hw = getattr(request, "visual_token_merger_block_hw", None)
+        if block_hw is None:
+            raw_block_hw = os.environ.get(
+                "VLLM_ONLINE_PREFILL_VISUAL_TOKEN_MERGER_BLOCK_HW"
+            )
+            if raw_block_hw not in (None, ""):
+                try:
+                    block_hw = int(raw_block_hw)
+                except ValueError:
+                    block_hw = None
+        if block_hw is not None:
+            kwargs["visual_token_merger_block_hw"] = int(block_hw)
+        return kwargs
+
+    @staticmethod
+    def _merge_mm_kwargs(
+        base: dict[str, Any],
+        override: dict[str, Any],
+    ) -> dict[str, Any]:
+        merged = dict(base)
+        merged.update(override)
+        return merged
+
+    @staticmethod
+    def _visual_token_merger_enabled(mm_processor_kwargs: dict[str, Any]) -> bool:
+        alpha = mm_processor_kwargs.get("visual_token_merger_alpha")
+        try:
+            return alpha is not None and float(alpha) < 0.999
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _visual_token_merger_uses_video_stream() -> bool:
+        raw = os.environ.get("VLLM_ONLINE_PREFILL_VISUAL_TOKEN_MERGER_INPUT", "image")
+        return raw.strip().lower() in {"1", "true", "yes", "video", "videos"}
+
     def _prepare_append_streaming_input(
         self,
         frames: list[OnlinePrefillFrame],
@@ -388,13 +479,28 @@ class OnlinePrefillSessionManager:
         suffix_text: str = "",
         stream_end: bool = False,
         finalize_suffix_text: str = "",
+        mm_processor_kwargs: dict[str, Any] | None = None,
     ) -> tuple[StreamingInput, int]:
         images = [self._decode_frame(frame) for frame in frames]
-        prompt, frame_token_sizes = self._preprocess_prompt(
-            images,
-            prefix_text=prefix_text,
-            suffix_text=suffix_text,
-        )
+        mm_processor_kwargs = dict(mm_processor_kwargs or {})
+        if (
+            images
+            and self._visual_token_merger_enabled(mm_processor_kwargs)
+            and self._visual_token_merger_uses_video_stream()
+        ):
+            prompt, frame_token_sizes = self._preprocess_video_prompt(
+                images,
+                prefix_text=prefix_text,
+                suffix_text=suffix_text,
+                mm_processor_kwargs=mm_processor_kwargs,
+            )
+        else:
+            prompt, frame_token_sizes = self._preprocess_prompt(
+                images,
+                prefix_text=prefix_text,
+                suffix_text=suffix_text,
+                mm_processor_kwargs=mm_processor_kwargs,
+            )
         finalize_token_ids = None
         if finalize_suffix_text:
             finalize_prompt = self._preprocess_text_prompt(finalize_suffix_text)
@@ -416,11 +522,14 @@ class OnlinePrefillSessionManager:
         *,
         prefix_text: str = "",
         suffix_text: str = "",
+        mm_processor_kwargs: dict[str, Any] | None = None,
     ) -> tuple[ProcessorInputs, list[int] | None]:
         raw_prompt = f"{prefix_text}{QWEN_VL_IMAGE_PLACEHOLDER * len(images)}{suffix_text}"
         preprocess_input: dict[str, Any] = {"prompt": raw_prompt}
         if images:
             preprocess_input["multi_modal_data"] = {"image": images}
+        if mm_processor_kwargs:
+            preprocess_input["mm_processor_kwargs"] = dict(mm_processor_kwargs)
         prompt = self.input_preprocessor.preprocess(preprocess_input)
         if not images:
             return prompt, None
@@ -463,6 +572,52 @@ class OnlinePrefillSessionManager:
             len(images),
         )
         return prompt, None
+
+    def _preprocess_video_prompt(
+        self,
+        images: list[Image.Image],
+        *,
+        prefix_text: str = "",
+        suffix_text: str = "",
+        mm_processor_kwargs: dict[str, Any],
+    ) -> tuple[ProcessorInputs, list[int] | None]:
+        raw_prompt = f"{prefix_text}{QWEN_VL_VIDEO_PLACEHOLDER}{suffix_text}"
+        video, metadata = self._images_to_video_item(images)
+        processor_kwargs = dict(mm_processor_kwargs)
+        processor_kwargs.setdefault("do_sample_frames", False)
+        preprocess_input: dict[str, Any] = {
+            "prompt": raw_prompt,
+            "multi_modal_data": {"video": [(video, metadata)]},
+            "mm_processor_kwargs": processor_kwargs,
+        }
+        prompt = self.input_preprocessor.preprocess(preprocess_input)
+        return prompt, [self._prompt_token_count(prompt)]
+
+    @staticmethod
+    def _images_to_video_item(
+        images: list[Image.Image],
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        if not images:
+            raise ValueError("expected at least one frame for online-prefill video chunk")
+        rgb_frames = [np.asarray(img.convert("RGB")) for img in images]
+        if len(rgb_frames) == 1:
+            # Qwen3-VL video processor requires at least the temporal factor
+            # (2) frames. Duplicate a singleton online chunk instead of
+            # failing the streaming session.
+            rgb_frames.append(rgb_frames[0].copy())
+        video = np.stack(rgb_frames, axis=0)
+        fps = float(max(1, min(30, len(rgb_frames))))
+        metadata = {
+            "total_num_frames": int(video.shape[0]),
+            "fps": fps,
+            "width": int(video.shape[2]),
+            "height": int(video.shape[1]),
+            "duration": float(video.shape[0]) / fps,
+            "video_backend": "online_prefill",
+            "frames_indices": list(range(int(video.shape[0]))),
+            "do_sample_frames": False,
+        }
+        return video, metadata
 
     @staticmethod
     def _decode_frame(frame: OnlinePrefillFrame) -> Image.Image:

@@ -146,6 +146,19 @@ class Qwen2_5_VLImagePixelInputs(TensorSchema):
         TensorShape("ni", 3),
     ]
 
+    image_visual_token_merger_alpha: Annotated[
+        torch.Tensor | None,
+        TensorShape("ni"),
+    ] = None
+    image_visual_token_merger_block_t: Annotated[
+        torch.Tensor | None,
+        TensorShape("ni"),
+    ] = None
+    image_visual_token_merger_block_hw: Annotated[
+        torch.Tensor | None,
+        TensorShape("ni"),
+    ] = None
+
 
 class Qwen2_5_VLImageEmbeddingInputs(TensorSchema):
     """
@@ -174,6 +187,19 @@ class Qwen2_5_VLImageEmbeddingInputs(TensorSchema):
         torch.Tensor,
         TensorShape("ni", 3),
     ]
+
+    image_visual_token_merger_alpha: Annotated[
+        torch.Tensor | None,
+        TensorShape("ni"),
+    ] = None
+    image_visual_token_merger_block_t: Annotated[
+        torch.Tensor | None,
+        TensorShape("ni"),
+    ] = None
+    image_visual_token_merger_block_hw: Annotated[
+        torch.Tensor | None,
+        TensorShape("ni"),
+    ] = None
 
 
 Qwen2_5_VLImageInputs: TypeAlias = (

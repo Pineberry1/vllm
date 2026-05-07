@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from vllm.model_executor.models.qwen3_vl import Qwen3VLForConditionalGeneration
+from vllm.multimodal.evs import compute_mrope_for_media
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
     MultiModalFieldElem,
@@ -235,3 +236,93 @@ def test_match_qwen3vl_mrope_evs_on(
     )
 
     assert torch.equal(actual_mrope, expected_mrope_masked)
+
+
+def test_recompute_mrope_image_merger_chunk_after_vision_start():
+    input_tokens = [
+        11,
+        VISION_START_TOKEN_ID,
+        IMAGE_TOKEN_ID,
+        IMAGE_TOKEN_ID,
+        VISION_END_TOKEN_ID,
+        12,
+    ]
+    hidden_size = 16
+    image_grid_thw = (1, 2, 4)
+    retained_positions = compute_mrope_for_media(
+        torch.tensor(image_grid_thw),
+        spatial_merge_size=1,
+    )[:2]
+    multimodal_embeddings = [
+        torch.cat(
+            [
+                torch.zeros((2, hidden_size), dtype=torch.float32),
+                retained_positions.float(),
+            ],
+            dim=1,
+        )
+    ]
+    initial_mrope = torch.arange(len(input_tokens), dtype=torch.long).repeat(3, 1)
+
+    mm_out, actual_mrope, _ = Qwen3VLForConditionalGeneration._recompute_mrope_positions(
+        input_ids=input_tokens,
+        multimodal_embeddings=multimodal_embeddings,
+        mrope_positions=initial_mrope,
+        num_computed_tokens=2,
+        vision_start_token_id=VISION_START_TOKEN_ID,
+        image_token_id=IMAGE_TOKEN_ID,
+        video_token_id=VIDEO_TOKEN_ID,
+        visual_feature_width=hidden_size,
+    )
+
+    assert mm_out[0].shape == (2, hidden_size)
+    expected_media_positions = retained_positions[:, :3].T + 2
+    assert torch.equal(actual_mrope[:, 2:4], expected_media_positions)
+
+
+def test_recompute_mrope_keeps_pure_visual_width_when_mixed_with_merger_info():
+    input_tokens = [
+        11,
+        VISION_START_TOKEN_ID,
+        IMAGE_TOKEN_ID,
+        IMAGE_TOKEN_ID,
+        VISION_END_TOKEN_ID,
+        12,
+        VISION_START_TOKEN_ID,
+        IMAGE_TOKEN_ID,
+        IMAGE_TOKEN_ID,
+        VISION_END_TOKEN_ID,
+        13,
+    ]
+    hidden_size = 16
+    image_grid_thw = (1, 2, 4)
+    retained_positions = compute_mrope_for_media(
+        torch.tensor(image_grid_thw),
+        spatial_merge_size=1,
+    )[:2]
+    pure_visual_embedding = torch.zeros((2, hidden_size), dtype=torch.float32)
+    merger_embedding = torch.cat(
+        [
+            torch.ones((2, hidden_size), dtype=torch.float32),
+            retained_positions.float(),
+        ],
+        dim=1,
+    )
+    initial_mrope = torch.arange(len(input_tokens), dtype=torch.long).repeat(3, 1)
+
+    mm_out, actual_mrope, _ = Qwen3VLForConditionalGeneration._recompute_mrope_positions(
+        input_ids=input_tokens,
+        multimodal_embeddings=[pure_visual_embedding, merger_embedding],
+        mrope_positions=initial_mrope,
+        num_computed_tokens=7,
+        vision_start_token_id=VISION_START_TOKEN_ID,
+        image_token_id=IMAGE_TOKEN_ID,
+        video_token_id=VIDEO_TOKEN_ID,
+        visual_feature_width=hidden_size,
+    )
+
+    assert mm_out[0].shape == (2, hidden_size)
+    assert mm_out[1].shape == (2, hidden_size)
+    assert torch.cat(mm_out, dim=0).shape == (4, hidden_size)
+    expected_media_positions = retained_positions[:, :3].T + 7
+    assert torch.equal(actual_mrope[:, 7:9], expected_media_positions)

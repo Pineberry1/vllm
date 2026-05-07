@@ -3,13 +3,14 @@
 
 import asyncio
 from collections.abc import AsyncGenerator
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from vllm.engine.protocol import StreamingInput
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import RequestOutputKind, SamplingParams
+from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.output_processor import RequestOutputCollector
 
@@ -170,3 +171,142 @@ async def test_generate_with_async_generator():
     assert outputs[2].finished is True
     # Both inputs were processed
     assert inputs_received == ["Hello", " world"]
+
+
+def make_engine_core_request(
+    request_id: str,
+    sampling_params: SamplingParams,
+    *,
+    resumable: bool = False,
+    online_prefill_enabled: bool = False,
+    stream_end: bool = False,
+) -> EngineCoreRequest:
+    return EngineCoreRequest(
+        request_id=request_id,
+        prompt_token_ids=[1] if resumable else [0],
+        mm_features=None,
+        sampling_params=sampling_params,
+        pooling_params=None,
+        arrival_time=0.0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+        resumable=resumable,
+        online_prefill_enabled=online_prefill_enabled,
+        stream_end=stream_end,
+    )
+
+
+def make_streaming_async_llm(sampling_params: SamplingParams):
+    llm = MagicMock(spec=AsyncLLM)
+    llm.model_config = MagicMock()
+    llm.get_supported_tasks = AsyncMock(return_value=("generate",))
+    llm.input_processor = MagicMock()
+    llm.output_processor = MagicMock()
+    llm.output_processor.request_states = {"internal": object()}
+    llm._run_output_handler = MagicMock()
+    llm.log_requests = False
+
+    def process_inputs(
+        request_id,
+        prompt,
+        params,
+        *args,
+        resumable=False,
+        online_prefill_enabled=False,
+        stream_end=False,
+        **kwargs,
+    ):
+        return make_engine_core_request(
+            request_id,
+            params,
+            resumable=resumable,
+            online_prefill_enabled=online_prefill_enabled,
+            stream_end=stream_end,
+        )
+
+    def assign_request_id(request: EngineCoreRequest):
+        request.request_id = "internal"
+
+    llm.input_processor.process_inputs.side_effect = process_inputs
+    llm.input_processor.assign_request_id.side_effect = assign_request_id
+    llm._add_streaming_input_request = AsyncLLM._add_streaming_input_request.__get__(
+        llm, AsyncLLM
+    )
+    return llm
+
+
+async def wait_stream_input_task(queue: RequestOutputCollector):
+    while queue._input_stream_task is not None:
+        await asyncio.sleep(0)
+
+
+async def _run_online_prefill_final_signal_does_not_reenter_engine_core():
+    sampling_params = SamplingParams(max_tokens=10)
+    llm = make_streaming_async_llm(sampling_params)
+    core_adds: list[EngineCoreRequest] = []
+
+    async def add_request(request, *args, **kwargs):
+        core_adds.append(request)
+
+    llm._add_request = add_request
+
+    async def input_generator() -> AsyncGenerator[StreamingInput, None]:
+        yield StreamingInput(
+            prompt="frame",
+            sampling_params=sampling_params,
+            online_prefill_enabled=True,
+        )
+
+    with patch(
+        "vllm.v1.engine.async_llm.extract_prompt_components",
+        return_value=(None, None, None),
+    ):
+        queue = await llm._add_streaming_input_request(
+            "external",
+            input_generator(),
+            sampling_params,
+        )
+        await wait_stream_input_task(queue)
+
+    assert [request.online_prefill_enabled for request in core_adds] == [True]
+    llm.output_processor.add_request.assert_called_once()
+    final_request = llm.output_processor.add_request.call_args.args[0]
+    assert final_request.request_id == "internal"
+    assert final_request.resumable is False
+
+
+def test_online_prefill_final_signal_does_not_reenter_engine_core():
+    asyncio.run(_run_online_prefill_final_signal_does_not_reenter_engine_core())
+
+
+async def _run_generic_streaming_final_signal_still_enters_engine_core():
+    sampling_params = SamplingParams(max_tokens=10)
+    llm = make_streaming_async_llm(sampling_params)
+    core_adds: list[EngineCoreRequest] = []
+
+    async def add_request(request, *args, **kwargs):
+        core_adds.append(request)
+
+    llm._add_request = add_request
+
+    async def input_generator() -> AsyncGenerator[StreamingInput, None]:
+        yield StreamingInput(prompt="chunk", sampling_params=sampling_params)
+
+    with patch(
+        "vllm.v1.engine.async_llm.extract_prompt_components",
+        return_value=(None, None, None),
+    ):
+        queue = await llm._add_streaming_input_request(
+            "external",
+            input_generator(),
+            sampling_params,
+        )
+        await wait_stream_input_task(queue)
+
+    assert [request.resumable for request in core_adds] == [True, False]
+    llm.output_processor.add_request.assert_not_called()
+
+
+def test_generic_streaming_final_signal_still_enters_engine_core():
+    asyncio.run(_run_generic_streaming_final_signal_still_enters_engine_core())

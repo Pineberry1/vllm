@@ -460,6 +460,8 @@ class Scheduler(SchedulerInterface):
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
                     self._early_finalize_request(request, scheduled_timestamp)
+                    self._requeue_early_finalized_decode(request)
+                    continue
                 # The request cannot be scheduled because one of the following
                 # reasons:
                 # 1. No new tokens to schedule. This may happen when
@@ -519,14 +521,19 @@ class Scheduler(SchedulerInterface):
                         if not early_finalize:
                             self.running.remove(preempted_req)
                             req_index -= 1
-                    elif early_finalize and preempted_req in self.running:
-                        self.running.remove(preempted_req)
 
                     if early_finalize:
+                        if preempted_req.has_encoder_inputs:
+                            self.encoder_cache_manager.free(preempted_req)
                         self._early_finalize_request(
                             preempted_req,
                             scheduled_timestamp,
                         )
+                        removed_index = self._requeue_early_finalized_decode(
+                            preempted_req
+                        )
+                        if removed_index is not None and removed_index < req_index:
+                            req_index -= 1
                     else:
                         if preempted_req in self.running:
                             self.running.remove(preempted_req)
@@ -657,13 +664,9 @@ class Scheduler(SchedulerInterface):
                             scheduled_timestamp,
                             allow_waiting=True,
                         )
-                        self._leave_waiting_for_streaming_input(request)
-                        if request.decode_blocked_until_stream_end:
-                            request.status = RequestStatus.WAITING
-                        else:
-                            request.status = RequestStatus.PREEMPTED
-                        self._remove_request_from_waiting_queues(request)
-                        step_skipped_waiting.prepend_request(request)
+                        self._requeue_early_finalized_decode(
+                            request, step_skipped_waiting
+                        )
                         continue
                     self._remove_request_from_waiting_queues(request)
                     step_skipped_waiting.prepend_request(request)
@@ -689,11 +692,14 @@ class Scheduler(SchedulerInterface):
                         self._should_early_finalize_waiting(request)
                         and self._is_kv_cache_under_pressure()
                     ):
+                        if request.has_encoder_inputs:
+                            self.encoder_cache_manager.free(request)
                         self._early_finalize_request(
                             request, scheduled_timestamp, allow_waiting=True
                         )
-                        self._remove_request_from_waiting_queues(request)
-                        step_skipped_waiting.prepend_request(request)
+                        self._requeue_early_finalized_decode(
+                            request, step_skipped_waiting
+                        )
                         continue
                     self._remove_request_from_waiting_queues(request)
                     self._enter_waiting_for_streaming_input(request)
@@ -767,6 +773,44 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
+                    if (
+                        request.is_online_prefill_request
+                        and request.online_stream_ended
+                        and not request.decode_blocked_until_stream_end
+                        and num_new_tokens <= 0
+                        and request.num_tokens > 0
+                    ):
+                        logger.warning(
+                            "online_prefill decode_requeue_recovered request_id=%s "
+                            "reason=waiting_zero_decode status=%s computed=%s "
+                            "cached_computed=%s total=%s received=%s prefilled=%s "
+                            "placeholders=%s deferred=%s",
+                            request.request_id,
+                            request.status.name,
+                            request.num_computed_tokens,
+                            num_computed_tokens,
+                            request.num_tokens,
+                            request.num_prompt_tokens_received,
+                            request.num_prompt_tokens_prefilled,
+                            request.num_output_placeholders,
+                            len(request.deferred_output_token_ids),
+                        )
+                        request.num_computed_tokens = max(
+                            request.num_computed_tokens, num_computed_tokens
+                        )
+                        self._prepare_online_prefill_decode_requeue(
+                            request, reason="waiting_zero_decode"
+                        )
+                        new_computed_blocks = (
+                            self.kv_cache_manager.empty_kv_cache_blocks
+                        )
+                        num_new_local_computed_tokens = 0
+                        num_external_computed_tokens = 0
+                        request.num_external_computed_tokens = 0
+                        connector_prefix_cache_queries = 0
+                        connector_prefix_cache_hits = 0
+                        num_computed_tokens = request.num_computed_tokens
+                        num_new_tokens = request.num_tokens - num_computed_tokens
                     if (
                         request.is_online_prefill_request
                         and request.decode_blocked_until_stream_end
@@ -848,8 +892,9 @@ class Scheduler(SchedulerInterface):
                                     scheduled_timestamp,
                                     allow_waiting=True,
                                 )
-                                self._remove_request_from_waiting_queues(request)
-                                step_skipped_waiting.prepend_request(request)
+                                self._requeue_early_finalized_decode(
+                                    request, step_skipped_waiting
+                                )
                                 continue
                             if request.online_stream_ended:
                                 logger.warning(
@@ -920,8 +965,9 @@ class Scheduler(SchedulerInterface):
                         self._early_finalize_request(
                             request, scheduled_timestamp, allow_waiting=True
                         )
-                        self._remove_request_from_waiting_queues(request)
-                        step_skipped_waiting.prepend_request(request)
+                        self._requeue_early_finalized_decode(
+                            request, step_skipped_waiting
+                        )
                         continue
                     if request.online_stream_ended:
                         logger.warning(
@@ -1209,13 +1255,7 @@ class Scheduler(SchedulerInterface):
                 timestamp,
                 allow_waiting=True,
             )
-            self._leave_waiting_for_streaming_input(request)
-            if request.decode_blocked_until_stream_end:
-                request.status = RequestStatus.WAITING
-            else:
-                request.status = RequestStatus.PREEMPTED
-            self._remove_request_from_waiting_queues(request)
-            self.skipped_waiting.prepend_request(request)
+            self._requeue_early_finalized_decode(request)
 
     def _log_online_prefill_early_finalize_probe(self, timestamp: float) -> None:
         if (
@@ -1355,6 +1395,23 @@ class Scheduler(SchedulerInterface):
             request.num_prompt_tokens_prefilled,
             len(request.online_prefill_finalize_token_ids or ()),
         )
+
+    def _requeue_early_finalized_decode(
+        self,
+        request: Request,
+        queue=None,
+    ) -> int | None:
+        removed_index = None
+        if request in self.running:
+            removed_index = self.running.index(request)
+            self.running.pop(removed_index)
+        self._leave_waiting_for_streaming_input(request)
+        self._remove_request_from_waiting_queues(request)
+        request.status = RequestStatus.WAITING
+        self.prev_step_scheduled_req_ids.discard(request.request_id)
+        target_queue = queue if queue is not None else self.skipped_waiting
+        target_queue.prepend_request(request)
+        return removed_index
 
     def _can_preempt_request(
         self,
@@ -1537,9 +1594,9 @@ class Scheduler(SchedulerInterface):
             and session.online_stream_ended
             and session.get_unprefilled_prompt_len() == 0
         ):
-            session.decode_blocked_until_stream_end = False
-            session.pending_stream_flush = False
-            session.status = RequestStatus.PREEMPTED
+            self._prepare_online_prefill_decode_requeue(
+                session, reason="stream_end_update"
+            )
         else:
             session.status = RequestStatus.WAITING
 
@@ -2252,6 +2309,34 @@ class Scheduler(SchedulerInterface):
         # prompt tokens are prefilled.
         request.prepare_online_prefill_prefix_rescan()
 
+    def _prepare_online_prefill_decode_requeue(
+        self, request: Request, reason: str
+    ) -> None:
+        request.decode_blocked_until_stream_end = False
+        request.pending_stream_flush = False
+        request.num_output_placeholders = max(request.num_output_placeholders, 1)
+        self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)
+        if (
+            request.num_computed_tokens >= request.num_tokens
+            and request.num_tokens > 0
+        ):
+            request.num_computed_tokens = request.num_tokens - 1
+        logger.info(
+            "online_prefill decode_requeued request_id=%s reason=%s "
+            "prefilled=%s received=%s deferred=%s computed=%s total=%s "
+            "placeholders=%s",
+            request.request_id,
+            reason,
+            request.num_prompt_tokens_prefilled,
+            request.num_prompt_tokens_received,
+            len(request.deferred_output_token_ids),
+            request.num_computed_tokens,
+            request.num_tokens,
+            request.num_output_placeholders,
+        )
+        request.status = RequestStatus.PREEMPTED
+        self.prev_step_scheduled_req_ids.discard(request.request_id)
+
     def _handle_stopped_request(self, request: Request) -> bool:
         "Return True if finished (can be False for resumable requests)."
         if (
@@ -2279,25 +2364,11 @@ class Scheduler(SchedulerInterface):
         if (
             request.is_online_prefill_request
             and request.online_stream_ended
-            and not request.decode_blocked_until_stream_end
             and request.num_output_tokens == 0
         ):
-            request.num_output_placeholders = max(request.num_output_placeholders, 1)
-            self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)  # BAVA_PATCH: sync KV manager before cap (mirror upstream :2486)
-            if request.num_computed_tokens >= request.num_tokens and request.num_tokens > 0:
-                request.num_computed_tokens = request.num_tokens - 1
-            logger.info(
-                "online_prefill decode_requeued request_id=%s prefilled=%s received=%s deferred=%s computed=%s total=%s placeholders=%s",
-                request.request_id,
-                request.num_prompt_tokens_prefilled,
-                request.num_prompt_tokens_received,
-                len(request.deferred_output_token_ids),
-                request.num_computed_tokens,
-                request.num_tokens,
-                request.num_output_placeholders,
+            self._prepare_online_prefill_decode_requeue(
+                request, reason="stopped_request"
             )
-            request.status = RequestStatus.PREEMPTED
-            self.prev_step_scheduled_req_ids.discard(request.request_id)
             self._enqueue_waiting_request(request)
             return False
 
@@ -2316,9 +2387,9 @@ class Scheduler(SchedulerInterface):
                 if request.is_online_prefill_request:
                     request.mark_stream_end()
                     if request.get_unprefilled_prompt_len() == 0:
-                        request.decode_blocked_until_stream_end = False
-                        request.pending_stream_flush = False
-                        request.status = RequestStatus.PREEMPTED
+                        self._prepare_online_prefill_decode_requeue(
+                            request, reason="streaming_queue_finished"
+                        )
                     else:
                         request.status = RequestStatus.WAITING
                 elif request.status == RequestStatus.RUNNING:
@@ -2492,9 +2563,9 @@ class Scheduler(SchedulerInterface):
                 existing.mark_stream_end()
                 self._leave_waiting_for_streaming_input(existing)
                 if existing.get_unprefilled_prompt_len() == 0:
-                    existing.decode_blocked_until_stream_end = False
-                    existing.pending_stream_flush = False
-                    existing.status = RequestStatus.PREEMPTED
+                    self._prepare_online_prefill_decode_requeue(
+                        existing, reason="empty_final_signal"
+                    )
                 else:
                     existing.status = RequestStatus.WAITING
                 self._requeue_existing_waiting_request(existing)
@@ -2508,9 +2579,9 @@ class Scheduler(SchedulerInterface):
                 existing.mark_stream_end()
                 self._leave_waiting_for_streaming_input(existing)
                 if existing.get_unprefilled_prompt_len() == 0:
-                    existing.decode_blocked_until_stream_end = False
-                    existing.pending_stream_flush = False
-                    existing.status = RequestStatus.PREEMPTED
+                    self._prepare_online_prefill_decode_requeue(
+                        existing, reason="stream_end_only_update"
+                    )
                 else:
                     existing.status = RequestStatus.WAITING
                 self._requeue_existing_waiting_request(existing)
@@ -2904,9 +2975,9 @@ class Scheduler(SchedulerInterface):
                     if request.is_online_prefill_request:
                         request.mark_stream_end()
                         if request.get_unprefilled_prompt_len() == 0:
-                            request.decode_blocked_until_stream_end = False
-                            request.pending_stream_flush = False
-                            request.status = RequestStatus.PREEMPTED
+                            self._prepare_online_prefill_decode_requeue(
+                                request, reason="promote_streaming_queue_finished"
+                            )
                         else:
                             request.status = RequestStatus.WAITING
                     else:

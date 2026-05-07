@@ -92,3 +92,32 @@ def test_processor_num_frames_timestamp(
     assert len(video_phs) == 1, (
         f"Expected exactly 1 video placeholder, got {len(video_phs)}"
     )
+
+
+@pytest.mark.parametrize("model_id", [MODEL_ID])
+def test_processor_video_visual_token_merger_keeps_placeholder(
+    model_id: str,
+) -> None:
+    ctx = build_model_context(
+        model_id,
+        limit_mm_per_prompt={"image": 0, "video": 1},
+    )
+    processor = MULTIMODAL_REGISTRY.create_processor(ctx.model_config)
+
+    prompt = "<|vision_start|><|video_pad|><|vision_end|>"
+    mm_data = _build_video_mm_data(num_frames=8)
+
+    processed = processor(
+        prompt,
+        mm_items=processor.info.parse_mm_data(mm_data),
+        hf_processor_mm_kwargs={
+            "visual_token_merger_alpha": 0.5,
+            "visual_token_merger_block_t": 1,
+            "visual_token_merger_block_hw": 2,
+            "do_sample_frames": False,
+        },
+    )
+
+    video_phs = processed["mm_placeholders"].get("video", [])
+    assert len(video_phs) == 1
+    assert video_phs[0].length > 0

@@ -287,7 +287,10 @@ def recompute_mrope_positions(
             ):
                 in_the_middle_of_media = True
 
-            if in_the_middle_of_media:
+            future_vision_start_indices = vision_start_indices[
+                vision_start_indices >= num_computed_tokens
+            ]
+            if in_the_middle_of_media or len(future_vision_start_indices) == 0:
                 mm_embeddings_seen = (
                     seen_mm_tokens - seem_mm_tokens_before_last_vision_start
                 )
@@ -295,9 +298,7 @@ def recompute_mrope_positions(
             else:
                 # We have completed previous mm_embedding part and
                 # ready to start a new one
-                next_vision_start_token = vision_start_indices[
-                    vision_start_indices >= num_computed_tokens
-                ][0]
+                next_vision_start_token = future_vision_start_indices[0]
                 mm_embeddings_seen = 0
                 global_mm_start = next_vision_start_token
 

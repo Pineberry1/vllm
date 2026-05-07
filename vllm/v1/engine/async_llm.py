@@ -463,9 +463,13 @@ class AsyncLLM(EngineClient):
         async def handle_inputs():
             cancelled = False
             saw_explicit_stream_end = False
+            saw_online_prefill_input = False
             try:
                 async for input_chunk in input_stream:
                     saw_explicit_stream_end = saw_explicit_stream_end or input_chunk.stream_end
+                    saw_online_prefill_input = (
+                        saw_online_prefill_input or input_chunk.online_prefill_enabled
+                    )
                     sp = input_chunk.sampling_params
                     if sp:
                         self._validate_streaming_input_sampling_params(sp)
@@ -515,7 +519,19 @@ class AsyncLLM(EngineClient):
                     # Always send an empty final request so the output processor
                     # can mark the last queued streaming chunk as final and
                     # eventually emit a finished RequestOutput after decode.
-                    await self._add_request(final_req, None, None, 0, queue)
+                    #
+                    # Online-prefill has its own explicit stream_end /
+                    # early-finalize state in EngineCore. Sending the generic
+                    # dummy request to EngineCore as well can race with async
+                    # outputs from an already-finished online request and reuse
+                    # the same internal request id as a plain request.
+                    if saw_online_prefill_input:
+                        if internal_req_id in self.output_processor.request_states:
+                            self.output_processor.add_request(
+                                final_req, None, None, 0, queue
+                            )
+                    else:
+                        await self._add_request(final_req, None, None, 0, queue)
 
         # Ensure output handler is running.
         self._run_output_handler()

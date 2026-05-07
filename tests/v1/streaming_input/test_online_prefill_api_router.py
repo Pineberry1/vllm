@@ -39,6 +39,7 @@ def _patch_prepare(manager: OnlinePrefillSessionManager):
         suffix_text: str = "",
         stream_end: bool = False,
         finalize_suffix_text: str = "",
+        mm_processor_kwargs=None,
     ):
         calls.append(
             {
@@ -47,6 +48,7 @@ def _patch_prepare(manager: OnlinePrefillSessionManager):
                 "suffix_text": suffix_text,
                 "stream_end": stream_end,
                 "finalize_suffix_text": finalize_suffix_text,
+                "mm_processor_kwargs": mm_processor_kwargs or {},
             }
         )
         return (
@@ -146,6 +148,7 @@ def test_online_prefill_single_append_coalesces_prefix_and_suffix():
                 ),
                 "finalize_suffix_text": "",
                 "stream_end": True,
+                "mm_processor_kwargs": {},
             }
         ]
         assert len(engine.seen_inputs) == 1
@@ -153,6 +156,66 @@ def test_online_prefill_single_append_coalesces_prefix_and_suffix():
         assert session.prompt_token_counts == [1]
 
     asyncio.run(run())
+
+
+def test_online_prefill_forwards_visual_token_merger_kwargs():
+    async def run():
+        engine = FakeEngineClient()
+        manager = OnlinePrefillSessionManager(engine)
+        calls = _patch_prepare(manager)
+
+        session = await manager.create_session(
+            OnlinePrefillCreateRequest(
+                request_id="req-alpha",
+                prompt="Describe it.",
+                visual_token_merger_alpha=0.5,
+                visual_token_merger_block_hw=2,
+            )
+        )
+        frame = OnlinePrefillFrame(data="x")
+        await manager.append(
+            "req-alpha", OnlinePrefillAppendRequest(frames=[frame], stream_end=True)
+        )
+        await session.generation_task
+
+        assert calls[0]["mm_processor_kwargs"] == {
+            "visual_token_merger_alpha": 0.5,
+            "visual_token_merger_block_hw": 2,
+        }
+
+    asyncio.run(run())
+
+
+def test_online_prefill_visual_merger_can_use_video_stream(monkeypatch):
+    monkeypatch.setenv("VLLM_ONLINE_PREFILL_VISUAL_TOKEN_MERGER_INPUT", "video")
+    engine = FakeEngineClient()
+    manager = OnlinePrefillSessionManager(engine)
+    calls = []
+
+    manager._decode_frame = lambda frame: object()
+    manager._prompt_token_count = lambda prompt: 5
+
+    def fake_preprocess_video_prompt(
+        images,
+        *,
+        prefix_text: str = "",
+        suffix_text: str = "",
+        mm_processor_kwargs,
+    ):
+        calls.append(("video", len(images), dict(mm_processor_kwargs)))
+        return {"path": "video"}, [5]
+
+    manager._preprocess_video_prompt = fake_preprocess_video_prompt
+    streaming_input, prompt_token_count = manager._prepare_append_streaming_input(
+        [OnlinePrefillFrame(data="x")],
+        stream_end=True,
+        mm_processor_kwargs={"visual_token_merger_alpha": 0.5},
+    )
+
+    assert calls == [("video", 1, {"visual_token_merger_alpha": 0.5})]
+    assert streaming_input.prompt == {"path": "video"}
+    assert streaming_input.frame_token_sizes == [5]
+    assert prompt_token_count == 5
 
 
 def test_online_prefill_marks_early_finalized_and_blocks_append():
