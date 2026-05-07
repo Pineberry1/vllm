@@ -275,6 +275,139 @@ def test_online_prefill_decode_starts_after_stream_end():
     assert request.deferred_output_token_ids == []
 
 
+@pytest.mark.parametrize("use_stream_end_update", [False, True])
+def test_online_prefill_empty_hidden_output_decodes_after_stream_end(
+    use_stream_end_update: bool,
+):
+    scheduler = create_scheduler(enable_online_prefill=True)
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=512,
+        req_ids=["online"],
+        resumable=True,
+        online_prefill_enabled=True,
+    )
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {"online": 512}
+    scheduler.update_from_output(output, _make_model_runner_output(request, []))
+    assert request.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+    assert request.deferred_output_token_ids == []
+    assert request.num_computed_tokens == request.num_tokens
+
+    if use_stream_end_update:
+        (end_signal,) = create_requests(
+            num_requests=1,
+            num_tokens=0,
+            req_ids=["online"],
+            resumable=True,
+            online_prefill_enabled=True,
+            stream_end=True,
+        )
+    else:
+        (end_signal,) = create_requests(num_requests=1, num_tokens=1, req_ids=["online"])
+    scheduler.add_request(end_signal)
+
+    assert request.status == RequestStatus.PREEMPTED
+    assert not request.decode_blocked_until_stream_end
+    assert request.num_output_placeholders == 1
+    assert request.num_computed_tokens == request.num_tokens - 1
+
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {"online": 1}
+    assert output.scheduled_cached_reqs.num_reqs == 1
+
+
+def test_online_prefill_streaming_queue_sentinel_decodes_after_empty_hidden_output():
+    scheduler = create_scheduler(enable_online_prefill=True)
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=512,
+        req_ids=["online"],
+        resumable=True,
+        online_prefill_enabled=True,
+    )
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    scheduler.update_from_output(output, _make_model_runner_output(request, []))
+    assert request.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+    assert request.streaming_queue is not None
+    assert request.num_computed_tokens == request.num_tokens
+
+    request.streaming_queue.append(None)
+
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {"online": 1}
+    assert output.scheduled_cached_reqs.num_reqs == 1
+
+
+def test_online_prefill_stream_end_update_decodes_after_empty_hidden_output():
+    scheduler = create_scheduler(enable_online_prefill=True)
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=512,
+        req_ids=["online"],
+        resumable=True,
+        online_prefill_enabled=True,
+    )
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    scheduler.update_from_output(output, _make_model_runner_output(request, []))
+    assert request.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+    assert request.num_computed_tokens == request.num_tokens
+
+    scheduler._leave_waiting_for_streaming_input(request)
+    request.status = RequestStatus.PREEMPTED
+    (end_update,) = create_requests(
+        num_requests=1,
+        num_tokens=0,
+        req_ids=["online"],
+        resumable=True,
+        online_prefill_enabled=True,
+        stream_end=True,
+    )
+    scheduler.add_request(end_update)
+
+    assert request.status == RequestStatus.PREEMPTED
+    assert request.num_output_placeholders == 1
+    assert request.num_computed_tokens == request.num_tokens - 1
+
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {"online": 1}
+    assert output.scheduled_cached_reqs.num_reqs == 1
+
+
+def test_online_prefill_waiting_zero_decode_guard_recovers_legacy_state():
+    scheduler = create_scheduler(enable_online_prefill=True)
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=512,
+        req_ids=["online"],
+        resumable=True,
+        online_prefill_enabled=True,
+    )
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    scheduler.update_from_output(output, _make_model_runner_output(request, []))
+    assert request.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+    assert request.num_computed_tokens == request.num_tokens
+
+    scheduler._leave_waiting_for_streaming_input(request)
+    request.mark_stream_end()
+    request.decode_blocked_until_stream_end = False
+    request.pending_stream_flush = False
+    request.status = RequestStatus.PREEMPTED
+    scheduler._requeue_existing_waiting_request(request)
+
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {"online": 1}
+    assert output.scheduled_cached_reqs.num_reqs == 1
+
+
 def test_online_prefill_tail_flush_happens_only_after_stream_end():
     scheduler = create_scheduler(enable_online_prefill=True)
     (request,) = create_requests(
@@ -696,7 +829,10 @@ def test_online_prefill_preemption_routes_to_early_finalize(tmp_path):
 
     output = scheduler.schedule()
 
-    assert online_req.request_id not in output.num_scheduled_tokens
+    assert output.num_scheduled_tokens[online_req.request_id] == 2
+    assert [req.req_id for req in output.scheduled_new_reqs] == [
+        online_req.request_id
+    ]
     assert early_finalize_spy.call_count == 1
     assert preempt_spy.call_count == 0
     assert online_req.early_finalized is True
